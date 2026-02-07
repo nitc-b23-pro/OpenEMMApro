@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual Environment
+venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Logs and data
+*.log
+*.pkl
+
+# Project specific
+gpt_results/
+data/
+models/
+main_kh.py
