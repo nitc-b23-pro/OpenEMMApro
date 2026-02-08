@@ -20,11 +20,6 @@ from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, 
 from transformers import MllamaForConditionalGeneration, AutoProcessor, Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration, AutoTokenizer
 from PIL import Image    #Used to load, resize, and preprocess images.
 from qwen_vl_utils import process_vision_info        #Prepares image + text input for Qwen VL models.
-from llava.model.builder import load_pretrained_model    #Loads pretrained LLaVA models.
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER#Special tokens used to inject images into text prompts.
-from llava.utils import disable_torch_init        #Speeds up model loading by disabling unnecessary weight initialization
-from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path        
-from llava.conversation import conv_templates        #Provides prompt templates for LLaVA chat-style interaction
 
 client = OpenAI(api_key="[your-openai-api-key]")
 
@@ -91,47 +86,6 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
                 generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
             return output_text[0]
-
-        elif "llava" in args.model_path:
-            conv_mode = "mistral_instruct"
-            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            if IMAGE_PLACEHOLDER in text:
-                if model.config.mm_use_im_start_end:
-                    text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
-                else:
-                    text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
-            else:
-                if model.config.mm_use_im_start_end:
-                    text = image_token_se + "\n" + text
-                else:
-                    text = DEFAULT_IMAGE_TOKEN + "\n" + text
-
-            conv = conv_templates[conv_mode].copy()
-            conv.append_message(conv.roles[0], text)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
-
-            input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-            image = Image.open(images).convert('RGB')
-
-            image_tensor = process_images([image], processor, model.config)[0]
-
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor.unsqueeze(0).half().cuda(),
-                    image_sizes=[image.size],
-                    do_sample=True,
-                    temperature=0.2,
-                    top_p=None,
-                    num_beams=1,
-                    max_new_tokens=2048,
-                    use_cache=True,
-                    pad_token_id = tokenizer.eos_token_id,
-                )
-
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-            return outputs
                     
         elif "gpt" in args.model_path:
             PROMPT_MESSAGES = [
@@ -162,9 +116,6 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
 def SceneDescription(obs_images, processor=None, model=None, tokenizer=None, args=None):   #Generates a natural-language description of the driving scene using recent camera images.
     prompt = f"""You are a autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Describe the driving scene according to traffic lights, movements of other cars or pedestrians and lane markings."""
 
-    if "llava" in args.model_path:
-        prompt = f"""You are an autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Provide a concise description of the driving scene according to traffic lights, movements of other cars or pedestrians and lane markings."""
-
     result = vlm_inference(text=prompt, images=obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
     return result
 
@@ -181,14 +132,8 @@ def DescribeOrUpdateIntent(obs_images, prev_intent=None, processor=None, model=N
     if prev_intent is None:
         prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, describe the desired intent of the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
 
-        if "llava" in args.model_path:
-            prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, provide a concise description of the desired intent of  the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
-        
     else:
         prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Explain your current intent: """
-
-        if "llava" in args.model_path:
-            prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Provide a concise description explanation of your current intent: """
 
     result = vlm_inference(text=prompt, images=obs_images, processor=processor, model=model, tokenizer=tokenizer, args=args)
 
@@ -258,15 +203,25 @@ if __name__ == '__main__':
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    "/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct",
+                    "models/Qwen2.5-VL-3B-Instruct",
                     torch_dtype=torch.bfloat16,
                     attn_implementation="flash_attention_2",
                     device_map="auto"
                 )
-                processor = AutoProcessor.from_pretrained("/root/OpenEMMA/models/Qwen2.5-VL-3B-Instruct")
+                processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
                 qwen25_loaded = True
                 print("已本地加载 Qwen2.5-VL-3B-Instruct 并启用 flash attention。")
+                # # For cpu version
+                # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                #     "models/Qwen2.5-VL-3B-Instruct",
+                # torch_dtype=torch.float32,     # 👈 CPU safe
+                # device_map="cpu"               # 👈 force CPU
+                # )
+                # processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
+                # tokenizer = None
+                # qwen25_loaded = True
+                # print("Loaded Qwen2.5-VL-3B-Instruct")
             except Exception as e:
                 print("Qwen2.5-VL-3B-Instruct 加载失败，尝试加载 Qwen2-VL-7B-Instruct。")
                 print(e)
@@ -279,19 +234,6 @@ if __name__ == '__main__':
                 tokenizer = None
                 qwen25_loaded = False
                 print("已加载 Qwen2-VL-7B-Instruct。")
-        else:
-            if "llava" == args.model_path:    
-                disable_torch_init()
-                tokenizer, model, processor, context_len = load_pretrained_model("liuhaotian/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b")
-                image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            elif "llava" in args.model_path:
-                disable_torch_init()
-                tokenizer, model, processor, context_len = load_pretrained_model(args.model_path, None, "llava-v1.6-mistral-7b")
-                image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-            else:
-                model = None
-                processor = None
-                tokenizer=None
     except Exception as e:
         print("模型加载出现异常：", e)
 
