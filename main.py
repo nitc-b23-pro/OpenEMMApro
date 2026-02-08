@@ -204,9 +204,9 @@ if __name__ == '__main__':
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "models/Qwen2.5-VL-3B-Instruct",
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation="flash_attention_2",
-                    device_map="auto"
+                    torch_dtype=torch.float16,
+                    attn_implementation="sdpa",
+                    device_map="cuda"
                 )
                 processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
