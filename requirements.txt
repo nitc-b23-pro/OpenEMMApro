@@ -31,3 +31,9 @@ pandas
 seaborn
 
 thop  # FLOPs computation
+
+# command to run
+# python main.py --model-path qwen --dataroot data/nuscences_mini --version v1.0-mini --method openemma
+
+# command to download qwenVL model 2.5 
+# hf download Qwen/Qwen2.5-VL-3B-Instruct --local-dir models/Qwen2.5-VL-3B-Instruct 
