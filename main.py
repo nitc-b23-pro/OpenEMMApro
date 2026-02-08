@@ -27,8 +27,8 @@ OBS_LEN = 10
 FUT_LEN = 10
 TTL_LEN = OBS_LEN + FUT_LEN
 
-def getMessage(prompt, image=None, args=None):     #Based on Which Model You Selected either LLaMA/LLaVA or Qwen vision according to the model, prompt and image into the correct message structure
-    if "llama" in args.model_path or "Llama" in args.model_path:    #LLaMA/LLaVA are LLM's Developed by meta. LLaMA understands text and LLaVA understands text + images.
+def getMessage(prompt, image=None, args=None):
+    if "llama" in args.model_path or "Llama" in args.model_path:    
         message = [
             {"role": "user", "content": [
                 {"type": "image"},
@@ -41,7 +41,7 @@ def getMessage(prompt, image=None, args=None):     #Based on Which Model You Sel
                 {"type": "image", "image": image},
                 {"type": "text", "text": prompt}
             ]}
-        ]   
+        ]
     return message
 
 
@@ -199,7 +199,7 @@ if __name__ == '__main__':
     tokenizer = None
     qwen25_loaded = False
     try:
-        # 优先本地加载Qwen2.5-VL-3B-Instruct，并优选flash attention
+        # Loading Qwen2.5-VL-3B-Instruct，flash attention
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
@@ -211,7 +211,7 @@ if __name__ == '__main__':
                 processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
                 qwen25_loaded = True
-                print("已本地加载 Qwen2.5-VL-3B-Instruct 并启用 flash attention。")
+                print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
                 # # For cpu version
                 # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 #     "models/Qwen2.5-VL-3B-Instruct",
@@ -223,7 +223,7 @@ if __name__ == '__main__':
                 # qwen25_loaded = True
                 # print("Loaded Qwen2.5-VL-3B-Instruct")
             except Exception as e:
-                print("Qwen2.5-VL-3B-Instruct 加载失败，尝试加载 Qwen2-VL-7B-Instruct。")
+                print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
                 print(e)
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct",
@@ -233,9 +233,9 @@ if __name__ == '__main__':
                 processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
                 tokenizer = None
                 qwen25_loaded = False
-                print("已加载 Qwen2-VL-7B-Instruct。")
+                print("Successfully loaded Qwen2-VL-7B-Instruct。")
     except Exception as e:
-        print("模型加载出现异常：", e)
+        print("Exception:", e)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     timestamp = args.model_path + f"_results/{args.method}/" + timestamp
