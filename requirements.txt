@@ -34,10 +34,10 @@ thop  # FLOPs computation
 # huggingface_hub # for models
 # azureml-fsspec # for extracting nuscenes in azure cloud
 
-# command to run
-# python main.py --model-path qwen --dataroot data/nuscences_mini --version v1.0-mini --method openemma
+# # command to run
+# python main.py --model-path qwen --dataroot data/nuscenes_mini --version v1.0-mini --method openemma
 
-# command to download qwenVL model 2.5 
+# # command to download qwenVL model 2.5 
 # hf download Qwen/Qwen2.5-VL-3B-Instruct --local-dir models/Qwen2.5-VL-3B-Instruct 
 
 # python -c "import torch; print(torch.cuda.is_available())" # to check for cuda-torch

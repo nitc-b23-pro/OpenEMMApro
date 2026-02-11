@@ -21,3 +21,4 @@ gpt_results/
 data/
 models/
 main_kh.py
+qwen_results/
