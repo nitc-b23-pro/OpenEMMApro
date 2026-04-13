@@ -202,32 +202,33 @@ if __name__ == '__main__':
         # Loading Qwen2.5-VL-3B-Instruct，flash attention
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
-                # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                #     "models/Qwen2.5-VL-3B-Instruct",
-                #     torch_dtype=torch.float16,
-                #     attn_implementation="sdpa",
-                #     device_map="cuda"
-                # )
-                # processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
-                # tokenizer = None
-                # qwen25_loaded = True
-                # print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-                # For cpu version
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "models/Qwen2.5-VL-3B-Instruct",
-                torch_dtype=torch.float32,     # 👈 CPU safe
-                device_map="cpu"               # 👈 force CPU
+                    dtype=torch.float16,
+                    attn_implementation="sdpa",
+                    device_map="auto",
+                    low_cpu_mem_usage=True  
                 )
                 processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
                 qwen25_loaded = True
-                print("Loaded Qwen2.5-VL-3B-Instruct")
+                print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
+                #For cpu version
+                # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                #     "models/Qwen2.5-VL-3B-Instruct",
+                # dtype=torch.float32,     # 👈 CPU safe
+                # device_map="cpu"               # 👈 force CPU
+                # )
+                # processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
+                # tokenizer = None
+                # qwen25_loaded = True
+                # print("Loaded Qwen2.5-VL-3B-Instruct")
             except Exception as e:
                 print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
                 print(e)
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
                     "Qwen/Qwen2-VL-7B-Instruct",
-                    torch_dtype=torch.bfloat16,
+                    dtype=torch.bfloat16,
                     device_map="auto"
                 )
                 processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
