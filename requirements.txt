@@ -31,7 +31,7 @@ pandas
 seaborn
 
 thop  # FLOPs computation
-huggingface_hub # for models
+# huggingface_hub # for models
 # azureml-fsspec # for extracting nuscenes in azure cloud
 
 # command to run
