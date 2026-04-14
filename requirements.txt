@@ -31,6 +31,8 @@ pandas
 seaborn
 
 thop  # FLOPs computation
+huggingface_hub # for models
+# azureml-fsspec # for extracting nuscenes in azure cloud
 
 # command to run
 # python main.py --model-path qwen --dataroot data/nuscences_mini --version v1.0-mini --method openemma
