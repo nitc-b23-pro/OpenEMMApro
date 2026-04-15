@@ -43,3 +43,5 @@ thop  # FLOPs computation
 # python -c "import torch; print(torch.cuda.is_available())" # to check for cuda-torch
 # pip uninstall torch torchvision torchaudio -y # to uninstall existing torch (if installed for cpu)
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 # to dowload torch-cuda
+
+# #python 3.9.23 or 3.10.

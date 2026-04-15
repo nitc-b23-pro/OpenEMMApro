@@ -354,10 +354,10 @@ if __name__ == '__main__':
             # Allocate the images.
             if "gpt" in args.model_path:
                 img = cv2.imdecode(np.frombuffer(base64.b64decode(curr_image), dtype=np.uint8), cv2.IMREAD_COLOR)
-                img = yolo3d_nuScenes(img, calib=obs_camera_params[-1])[0]
             else:
                 with open(os.path.join(curr_image), "rb") as image_file:
                     img = cv2.imdecode(np.frombuffer(image_file.read(), dtype=np.uint8), cv2.IMREAD_COLOR)
+            img = yolo3d_nuScenes(img, calib=obs_camera_params[-1])[0]
 
             for rho in range(3):
                 # Assemble the prompt.
@@ -445,6 +445,12 @@ if __name__ == '__main__':
         mean_ade1s = np.mean(ade1s_list)
         mean_ade2s = np.mean(ade2s_list)
         mean_ade3s = np.mean(ade3s_list)
+        failure_rate = 0;
+        for f in ade1s_list:
+            if f>10:
+                failure_rate+=1
+        failure_rate = (failure_rate *100)/len(ade1s_list)
+                
         aveg_ade = np.mean([mean_ade1s, mean_ade2s, mean_ade3s])
 
         result = {
@@ -453,7 +459,8 @@ if __name__ == '__main__':
             "ade1s": mean_ade1s,
             "ade2s": mean_ade2s,
             "ade3s": mean_ade3s,
-            "avgade": aveg_ade
+            "avgade": aveg_ade,
+            "failure_rate": failure_rate
         }
 
         with open(f"{timestamp}/ade_results.jsonl", "a") as f:
