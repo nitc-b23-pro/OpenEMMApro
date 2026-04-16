@@ -240,13 +240,12 @@ def detect3DFromCVImg(
     roi_filter=None,
 ):
     current_dir = os.path.dirname(os.path.abspath(__file__))
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # load model
     base_model = model_factory[model_select]
-    regressor = regressor_factory[model_select](model=base_model).cuda()
-
+    regressor = regressor_factory[model_select](model=base_model).to(device)
     # load weight
-    checkpoint = torch.load(reg_weights, weights_only=True)
+    checkpoint = torch.load(reg_weights, map_location=device)
     regressor.load_state_dict(checkpoint["model_state_dict"])
     regressor.eval()
 
@@ -285,7 +284,7 @@ def detect3DFromCVImg(
             box_2d = det.box_2d
             detected_class = det.detected_class
 
-            input_tensor = torch.zeros([1, 3, 224, 224]).cuda()
+            input_tensor = torch.zeros([1, 3, 224, 224]).to(device)
             input_tensor[0, :, :, :] = input_img
 
             # predict orient, conf, and dim
