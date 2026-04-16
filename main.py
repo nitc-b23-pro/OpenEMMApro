@@ -273,7 +273,7 @@ if __name__ == '__main__':
                 dtype=torch.float32,     # 👈 CPU safe
                 device_map="cpu"               # 👈 force CPU
                 )
-                processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct") # first time you have to put "Qwen/Qwen2.5-VL-3B-Instruct" to download model
+                processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
                 qwen25_loaded = True
                 print("Loaded Qwen2.5-VL-3B-Instruct")
@@ -291,8 +291,8 @@ if __name__ == '__main__':
                 qwen25_loaded = False
                 print("Successfully loaded Qwen2-VL-7B-Instruct。")
         elif "llava" in args.model_path:
-            disable_torch_init() # first time you have to put "liuhaotian/llava-v1.6-mistral-7b" to download model
-            tokenizer, model, processor, context_len = load_pretrained_model("liuhaotian/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cpu", device_map="cpu")
+            disable_torch_init() 
+            tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cpu", device_map="cpu")
             image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
     except Exception as e:
         print("Exception:", e)
