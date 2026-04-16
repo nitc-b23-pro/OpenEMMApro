@@ -21,6 +21,12 @@ from transformers import MllamaForConditionalGeneration, AutoProcessor, Qwen2VLF
 from PIL import Image    #Used to load, resize, and preprocess images.
 from qwen_vl_utils import process_vision_info        #Prepares image + text input for Qwen VL models.
 
+from llava.model.builder import load_pretrained_model    #Loads pretrained LLaVA models.
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER#Special tokens used to inject images into text prompts.
+from llava.utils import disable_torch_init        #Speeds up model loading by disabling unnecessary weight initialization
+from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path        
+from llava.conversation import conv_templates        #Provides prompt templates for LLaVA chat-style interaction
+
 client = OpenAI(api_key="[your-openai-api-key]")
 
 OBS_LEN = 10
@@ -86,6 +92,54 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
                 generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
             )
             return output_text[0]
+        elif "llava" in args.model_path:
+            conv_mode = "mistral_instruct"
+            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+
+            if IMAGE_PLACEHOLDER in text:
+                if model.config.mm_use_im_start_end:
+                    text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
+                else:
+                    text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
+            else:
+                if model.config.mm_use_im_start_end:
+                    text = image_token_se + "\n" + text
+                else:
+                    text = DEFAULT_IMAGE_TOKEN + "\n" + text
+
+            conv = conv_templates[conv_mode].copy()
+            conv.append_message(conv.roles[0], text)
+            conv.append_message(conv.roles[1], None)
+            prompt = conv.get_prompt()
+
+            # remove .cuda()
+            input_ids = tokenizer_image_token(
+                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
+            ).unsqueeze(0)
+
+            image = Image.open(images).convert('RGB')
+
+            image_tensor = process_images([image], processor, model.config)[0]
+
+            # remove .half() and .cuda()
+            image_tensor = image_tensor.unsqueeze(0)
+
+            with torch.inference_mode():
+                output_ids = model.generate(
+                    input_ids=input_ids,
+                    images=image_tensor,
+                    image_sizes=[image.size],
+                    do_sample=True,
+                    temperature=0.2,
+                    top_p=None,
+                    num_beams=1,
+                    max_new_tokens=256,
+                    use_cache=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+
+            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+            return outputs
                     
         elif "gpt" in args.model_path:
             PROMPT_MESSAGES = [
@@ -219,7 +273,7 @@ if __name__ == '__main__':
                 dtype=torch.float32,     # 👈 CPU safe
                 device_map="cpu"               # 👈 force CPU
                 )
-                processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
+                processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct") # first time you have to put "Qwen/Qwen2.5-VL-3B-Instruct" to download model
                 tokenizer = None
                 qwen25_loaded = True
                 print("Loaded Qwen2.5-VL-3B-Instruct")
@@ -236,6 +290,10 @@ if __name__ == '__main__':
                 tokenizer = None
                 qwen25_loaded = False
                 print("Successfully loaded Qwen2-VL-7B-Instruct。")
+        elif "llava" in args.model_path:
+            disable_torch_init() # first time you have to put "liuhaotian/llava-v1.6-mistral-7b" to download model
+            tokenizer, model, processor, context_len = load_pretrained_model("liuhaotian/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cpu", device_map="cpu")
+            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
     except Exception as e:
         print("Exception:", e)
 
