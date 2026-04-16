@@ -39,7 +39,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['dtype'] = torch.float16
+        kwargs['dtype'] = torch.float32
 
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
@@ -156,7 +156,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if not vision_tower.is_loaded:
             vision_tower.load_model(device_map=device_map)
         if device_map != 'auto':
-            vision_tower.to(device=device_map, dtype=torch.float16)
+            vision_tower.to(device=device_map, dtype=torch.float32)
         image_processor = vision_tower.image_processor
 
     if hasattr(model.config, "max_sequence_length"):
