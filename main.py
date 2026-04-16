@@ -116,7 +116,6 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
             input_ids = tokenizer_image_token(
                 prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
             ).unsqueeze(0)
-
             image = Image.open(images).convert('RGB')
 
             image_tensor = process_images([image], processor, model.config)[0]
@@ -126,7 +125,7 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
 
             with torch.inference_mode():
                 output_ids = model.generate(
-                    input_ids=input_ids,
+                    inputs=input_ids,
                     images=image_tensor,
                     image_sizes=[image.size],
                     do_sample=True,
