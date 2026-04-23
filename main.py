@@ -27,7 +27,9 @@ from llava.utils import disable_torch_init        #Speeds up model loading by di
 from llava.mm_utils import tokenizer_image_token, process_images, get_model_name_from_path        
 from llava.conversation import conv_templates        #Provides prompt templates for LLaVA chat-style interaction
 
-client = OpenAI(api_key="[your-openai-api-key]")
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# client = OpenAI(api_key="[your-openai-api-key]")
 
 OBS_LEN = 10
 FUT_LEN = 10
@@ -112,7 +114,6 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
             conv.append_message(conv.roles[1], None)
             prompt = conv.get_prompt()
 
-            # remove .cuda()
             input_ids = tokenizer_image_token(
                 prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
             ).unsqueeze(0)
@@ -121,12 +122,11 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
 
             image_tensor = process_images([image], processor, model.config)[0]
 
-            # remove .half() and .cuda()
-            image_tensor = image_tensor.unsqueeze(0)
+            image_tensor = image_tensor.unsqueeze(0).to(model.device)
 
             with torch.inference_mode():
                 output_ids = model.generate(
-                    input_ids=input_ids,
+                    input_ids=input_ids.to(model.device),
                     images=image_tensor,
                     image_sizes=[image.size],
                     do_sample=True,
@@ -256,27 +256,27 @@ if __name__ == '__main__':
         # Loading Qwen2.5-VL-3B-Instruct，flash attention
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
-                # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                #     "models/Qwen2.5-VL-3B-Instruct",
-                #     dtype=torch.float16,
-                #     attn_implementation="sdpa",
-                #     device_map="auto",
-                #     low_cpu_mem_usage=True  
-                # )
-                # processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
-                # tokenizer = None
-                # qwen25_loaded = True
-                # print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-                #For cpu version
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "models/Qwen2.5-VL-3B-Instruct",
-                dtype=torch.float32,     # 👈 CPU safe
-                device_map="cpu"               # 👈 force CPU
+                    dtype=torch.float16,
+                    attn_implementation="flash_attention_2",
+                    device_map="auto",
+                    low_cpu_mem_usage=True  
                 )
                 processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
                 tokenizer = None
                 qwen25_loaded = True
-                print("Loaded Qwen2.5-VL-3B-Instruct")
+                print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
+                #For cpu version
+                # model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                #     "models/Qwen2.5-VL-3B-Instruct",
+                # dtype=torch.float32,  
+                # device_map="cpu"               
+                # )
+                # processor = AutoProcessor.from_pretrained("models/Qwen2.5-VL-3B-Instruct")
+                # tokenizer = None
+                # qwen25_loaded = True
+                # print("Loaded Qwen2.5-VL-3B-Instruct")
             except Exception as e:
                 print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
                 print(e)
@@ -292,7 +292,7 @@ if __name__ == '__main__':
                 print("Successfully loaded Qwen2-VL-7B-Instruct。")
         elif "llava" in args.model_path:
             disable_torch_init() 
-            tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cpu", device_map="cpu")
+            tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
             image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
     except Exception as e:
         print("Exception:", e)
