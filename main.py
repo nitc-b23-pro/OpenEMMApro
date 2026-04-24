@@ -118,7 +118,7 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
                 prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
             ).unsqueeze(0)
 
-            image = Image.open(images).convert('RGB')
+            image = Image.open(images[0]).convert('RGB')
 
             image_tensor = process_images([image], processor, model.config)[0]
 
@@ -126,7 +126,7 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
 
             with torch.inference_mode():
                 output_ids = model.generate(
-                    input_ids=input_ids.to(model.device),
+                    inputs=input_ids.to(model.device),
                     images=image_tensor,
                     image_sizes=[image.size],
                     do_sample=True,
@@ -294,6 +294,8 @@ if __name__ == '__main__':
             disable_torch_init() 
             tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
             image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+            model = model.half()
+            model.eval()
     except Exception as e:
         print("Exception:", e)
 
@@ -420,7 +422,7 @@ if __name__ == '__main__':
             for rho in range(3):
                 # Assemble the prompt.
                 if not "gpt" in args.model_path:
-                    obs_images = curr_image
+                    obs_images = [curr_image]
                 (prediction,
                 scene_description,
                 object_description,
