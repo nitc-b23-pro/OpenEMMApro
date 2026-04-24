@@ -310,7 +310,6 @@ if __name__ == '__main__':
     scenes = nusc.scene
     
     print(f"Number of scenes: {len(scenes)}")
-
     for scene in scenes:
         token = scene['token']
         first_sample_token = scene['first_sample_token']
@@ -318,8 +317,8 @@ if __name__ == '__main__':
         name = scene['name']
         description = scene['description']
 
-        if not name in ["scene-0103", "scene-1077"]:
-            continue
+        # if not name in ["scene-0103", "scene-1077"]:
+        #     continue
 
         # Get all image and pose in this scene
         front_camera_images = []

@@ -22,4 +22,5 @@ data/
 models/
 main_kh.py
 qwen_results/
+llava_results/
 openemma\YOLO3D\weights\resnet18.pkl
