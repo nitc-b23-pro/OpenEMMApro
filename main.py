@@ -65,7 +65,7 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
                 return_tensors="pt"
             ).to(model.device)
 
-            output = model.generate(**inputs, max_new_tokens=2048)
+            output = model.generate(**inputs, max_new_tokens=256)
 
             output_text = processor.decode(output[0])
 
@@ -116,17 +116,18 @@ def vlm_inference(text=None, images=None, sys_message=None, processor=None, mode
 
             input_ids = tokenizer_image_token(
                 prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-            ).unsqueeze(0)
+            ).unsqueeze(0).cuda()
 
             image = Image.open(images[0]).convert('RGB')
 
             image_tensor = process_images([image], processor, model.config)[0]
 
-            image_tensor = image_tensor.unsqueeze(0).to(model.device)
-
+            image_tensor = image_tensor.unsqueeze(0).half().cuda().to(model.device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
             with torch.inference_mode():
                 output_ids = model.generate(
                     inputs=input_ids.to(model.device),
+                    attention_mask=attention_mask,
                     images=image_tensor,
                     image_sizes=[image.size],
                     do_sample=True,
@@ -294,6 +295,9 @@ if __name__ == '__main__':
             disable_torch_init() 
             tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
             image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+            
+            tokenizer.pad_token = tokenizer.eos_token 
+            model.config.pad_token_id = tokenizer.pad_token_id
             model = model.half()
             model.eval()
     except Exception as e:
