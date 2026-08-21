@@ -23,3 +23,4 @@ models/
 main_kh.py
 qwen_results/
 openemma\YOLO3D\weights\resnet18.pkl
+assests/
