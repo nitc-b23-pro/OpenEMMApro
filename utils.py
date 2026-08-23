@@ -272,28 +272,28 @@ def EstimateCurvatureFromTrajectory(traj):
 
     return curvature
 
-def IntegrateCurvatureForPoints(curvatures, velocities_norm, initial_position, initial_heading, time_span):
-    t = np.linspace(0, time_span, time_span)  # Time vector
+def IntegrateCurvatureForPoints(
+    curvatures,
+    velocities_norm,
+    initial_position,
+    initial_heading,
+    dt,
+):
+    assert len(curvatures) == len(velocities_norm)
 
-    # Initial conditions
-    x0, y0 = initial_position[0], initial_position[1]  # Starting position
-    theta0 = initial_heading  # Initial orientation (radians)
+    position = np.asarray(initial_position[:2], dtype=float).copy()
+    heading = float(initial_heading)
+    trajectory = []
 
-    # Integrate to compute heading (theta)
-    theta = cumulative_trapezoid(curvatures * velocities_norm, t, initial=0)
-    theta += theta0  # 手动加上初始角度
+    for curvature, speed in zip(curvatures, velocities_norm):
+        heading += curvature * speed * dt
+        position += speed * np.array([
+            np.cos(heading),
+            np.sin(heading),
+        ]) * dt
+        trajectory.append(position.copy())
 
-    # Compute velocity components
-    v_x = velocities_norm * np.cos(theta)
-    v_y = velocities_norm * np.sin(theta)
-
-    # Integrate to compute trajectory
-    x = cumulative_trapezoid(v_x, t, initial=0)
-    y = cumulative_trapezoid(v_y, t, initial=0)
-    x += x0  # 手动加上初始位置
-    y += y0
-
-    return np.stack((x, y), axis=1)
+    return np.asarray(trajectory)
 
 def WriteImageSequenceToVideo(cam_images_sequence: list, filename):
     assert len(cam_images_sequence) >= 1, "No images to write to video."
