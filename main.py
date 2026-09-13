@@ -191,7 +191,8 @@ if __name__ == '__main__':
                     attn_implementation="sdpa",
                     device_map="auto"
                 )
-                processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/")
+                processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/", 
+                                                          use_fast=True)
                 tokenizer = None
                 print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
             except Exception as e:
