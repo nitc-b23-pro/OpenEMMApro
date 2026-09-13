@@ -197,8 +197,8 @@ if __name__ == '__main__':
                 print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
             except Exception as e:
                 print("Qwen2.5-VL-3B-Instruct failed")
+                print(e)
             #     print("loading Qwen2-VL-7B-Instruct。")
-            #     print(e)
             #     model = Qwen2VLForConditionalGeneration.from_pretrained(
             #         "Qwen/Qwen2-VL-7B-Instruct",
             #         dtype=torch.bfloat16,
