@@ -2,7 +2,7 @@
 torch
 torchvision
 accelerate
-#flash-attn
+flash-attn
 numpy<2.0.0
 matplotlib
 opencv-python
