@@ -188,9 +188,8 @@ if __name__ == '__main__':
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/",
                     dtype=torch.float16,
-                    attn_implementation="flash_attention_2",
-                    device_map="auto",
-                    low_cpu_mem_usage=True  
+                    attn_implementation="sdpa",
+                    device_map="auto"
                 )
                 processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/")
                 tokenizer = None
