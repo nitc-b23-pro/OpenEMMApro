@@ -195,18 +195,18 @@ if __name__ == '__main__':
                 processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/")
                 tokenizer = None
                 print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-            except Exception as e:
-                print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
-                print(e)
-                model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    "Qwen/Qwen2-VL-7B-Instruct",
-                    dtype=torch.bfloat16,
-                    attn_implementation="sdpa",
-                    device_map="auto"
-                )
-                processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-                tokenizer = None
-                print("Successfully loaded Qwen2-VL-7B-Instruct。")
+            # except Exception as e:
+            #     print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
+            #     print(e)
+            #     model = Qwen2VLForConditionalGeneration.from_pretrained(
+            #         "Qwen/Qwen2-VL-7B-Instruct",
+            #         dtype=torch.bfloat16,
+            #         attn_implementation="sdpa",
+            #         device_map="auto"
+            #     )
+            #     processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
+            #     tokenizer = None
+            #     print("Successfully loaded Qwen2-VL-7B-Instruct。")
         elif "llava" in args.model_path:
             disable_torch_init() 
             tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
