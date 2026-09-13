@@ -20,7 +20,7 @@ ultralytics
 qwen_vl_utils
 pyquaternion
 nuscenes-devkit
-openai
+# openai
 
 # # Logging -------------------------------------
 # tensorboard>=2.4.1
