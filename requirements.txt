@@ -3,7 +3,7 @@ torch
 torchvision
 accelerate
 #flash-attn
-numpy<2.0.0
+numpy
 matplotlib
 opencv-python
 Pillow
