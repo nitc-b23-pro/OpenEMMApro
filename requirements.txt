@@ -14,18 +14,15 @@ gdown
 flask
 Werkzeug
 
-transformers
+transformers==4.51.3
 ultralytics
 qwen_vl_utils
 pyquaternion
-nuscenes-devkit==1.2.0
 
 pandas
 seaborn
 thop
 
-numpy==1.26.4
-scipy==1.13.1
 # huggingface_hub # for models
 # azureml-fsspec # for extracting nuscenes in azure cloud
 
