@@ -48,7 +48,7 @@ def vlm_inference(text, image_path, processor, model, tokenizer, args):
                 padding=True,
                 return_tensors="pt",
             ).to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
+            generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
             generated_ids_trimmed = [
                 out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
             ]
@@ -187,7 +187,7 @@ if __name__ == '__main__':
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "/kaggle/working/qwen2.5-vl-3b-fixed/",
-                    torch_dtype=torch.float16,
+                    torch_dtype=torch.bfloat16,
                     attn_implementation="sdpa",
                     device_map="auto"
                 )
