@@ -1,8 +1,11 @@
-# Base ----------------------------------------
+# Base
+# torch                 # Already provided by Kaggle: 2.10.0+cu128
+# torchvision           # Already provided by Kaggle: 0.25.0+cu128
+
 accelerate
-#flash-attn
+
 matplotlib
-opencv-python
+opencv-python==4.11.0.86
 Pillow
 PyYAML
 requests
@@ -10,20 +13,19 @@ tqdm
 gdown
 flask
 Werkzeug
+
+transformers
 ultralytics
 qwen_vl_utils
 pyquaternion
 nuscenes-devkit==1.2.0
-# openai
 
-# # Logging -------------------------------------
-# tensorboard>=2.4.1
-# comet-ml
-
-# # Plotting ------------------------------------
+pandas
 seaborn
+thop
 
-thop  # FLOPs computation
+numpy==1.26.4
+scipy==1.13.1
 # huggingface_hub # for models
 # azureml-fsspec # for extracting nuscenes in azure cloud
 
