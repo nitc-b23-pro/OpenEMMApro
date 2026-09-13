@@ -13,7 +13,7 @@ Werkzeug
 ultralytics
 qwen_vl_utils
 pyquaternion
-nuscenes-devkit
+nuscenes-devkit==1.2.0
 # openai
 
 # # Logging -------------------------------------
