@@ -1,21 +1,15 @@
 # Base ----------------------------------------
-torch
-torchvision
 accelerate
 #flash-attn
-numpy<2.0.0
 matplotlib
 opencv-python
 Pillow
 PyYAML
 requests
-scipy
 tqdm
 gdown
 flask
 Werkzeug
-argparse
-transformers # for Mllama
 ultralytics
 qwen_vl_utils
 pyquaternion
@@ -27,7 +21,6 @@ nuscenes-devkit
 # comet-ml
 
 # # Plotting ------------------------------------
-pandas
 seaborn
 
 thop  # FLOPs computation
