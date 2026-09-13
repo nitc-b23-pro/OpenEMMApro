@@ -187,7 +187,7 @@ if __name__ == '__main__':
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                     "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/",
-                    dtype=torch.float16,
+                    torch_dtype=torch.float16,
                     attn_implementation="sdpa",
                     device_map="auto"
                 )
