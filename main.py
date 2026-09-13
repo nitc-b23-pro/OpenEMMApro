@@ -186,12 +186,12 @@ if __name__ == '__main__':
         if "qwen" in args.model_path or "Qwen" in args.model_path:
             try:
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    "/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/",
+                    "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/",
                     dtype=torch.float16,
                     attn_implementation="sdpa",
                     device_map="auto"
                 )
-                processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/")
+                processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/")
                 tokenizer = None
                 print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
             except Exception as e:
