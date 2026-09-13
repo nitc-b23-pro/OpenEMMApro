@@ -195,8 +195,9 @@ if __name__ == '__main__':
                 processor = AutoProcessor.from_pretrained("/kaggle/input/models/qwen-lm/qwen2.5/transformers/3b-instruct/1/")
                 tokenizer = None
                 print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-            # except Exception as e:
-            #     print("Qwen2.5-VL-3B-Instruct failed, loading Qwen2-VL-7B-Instruct。")
+            except Exception as e:
+                print("Qwen2.5-VL-3B-Instruct failed")
+            #     print("loading Qwen2-VL-7B-Instruct。")
             #     print(e)
             #     model = Qwen2VLForConditionalGeneration.from_pretrained(
             #         "Qwen/Qwen2-VL-7B-Instruct",
