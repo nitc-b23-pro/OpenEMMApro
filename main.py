@@ -13,15 +13,12 @@ from nuscenes import NuScenes
 import json
 from openemma.YOLO3D.inference import yolo3d_nuScenes
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
+from build_model import build_openemma_tinyvla
+from llava_pythia.mm_utils import tokenizer_image_token
+from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
+from precompute_intents import describe_or_update_intent
+from transformers import AutoTokenizer, CLIPImageProcessor
 from PIL import Image
-from qwen_vl_utils import process_vision_info
-
-from llava.model.builder import load_pretrained_model
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER
-from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images
-from llava.conversation import conv_templates
 
 OBS_LEN = 10
 FUT_LEN = 10
@@ -33,139 +30,41 @@ def get_message(prompt, image):
         {"type": "text", "text": prompt},
     ]}]
 
+# --- ADD a new function, replacing the deleted GenerateMotion/vlm_inference ---
+def predict_step(image_path, obs_velocities, obs_curvatures, prev_intent,
+                  model, tokenizer, image_processor):
+    obs_norm = np.linalg.norm(obs_velocities, axis=1)
+    obs_curv = obs_curvatures * 100
+    state = torch.tensor(np.stack([obs_norm, obs_curv], axis=1).flatten(),
+                          dtype=torch.float32).unsqueeze(0).cuda()   # (1, 20)
 
-def vlm_inference(text, image_path, processor, model, tokenizer, args):
-        if "qwen" in args.model_path.lower():
-            message = get_message(text, image_path)
-            text = processor.apply_chat_template(
-                message, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(message)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            return output_text[0]
-        elif "llava" in args.model_path.lower():
-            conv_mode = "mistral_instruct"
-            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
+    prompt = DEFAULT_IMAGE_TOKEN + "\n" + \
+        f"Given the driving intent: {prev_intent}. Predict the future speeds and curvatures."
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX,
+                                       return_tensors="pt").unsqueeze(0).cuda()
 
-            if IMAGE_PLACEHOLDER in text:
-                if model.config.mm_use_im_start_end:
-                    text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
-                else:
-                    text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
-            else:
-                if model.config.mm_use_im_start_end:
-                    text = image_token_se + "\n" + text
-                else:
-                    text = DEFAULT_IMAGE_TOKEN + "\n" + text
+    img = Image.open(image_path).convert("RGB")
+    image_tensor = image_processor.preprocess(img, return_tensors="pt")["pixel_values"].cuda()
 
-            conv = conv_templates[conv_mode].copy()
-            conv.append_message(conv.roles[0], text)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
+    with torch.inference_mode():
+        # eval=True triggers the diffusion "sculptor" loop instead of text generation --
+        # it returns a ready-made (1, 10, 2) tensor, not a sentence.
+        pred = model(input_ids=input_ids, images=image_tensor, states=state, eval=True)
 
-            input_ids = tokenizer_image_token(
-                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-            ).unsqueeze(0).cuda()
+    speed_curvature_pred = pred[0].cpu().numpy().tolist()   # [[speed, curv], ... x10] -- done, no regex
+    return speed_curvature_pred
 
-            image = Image.open(image_path).convert('RGB')
+# def DescribeOrUpdateIntent(image_path, prev_intent=None, processor=None, model=None, tokenizer=None, args=None):
 
-            image_tensor = process_images([image], processor, model.config)[0]
+#     if prev_intent is None:
+#         prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, describe the desired intent of the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
 
-            image_tensor = image_tensor.unsqueeze(0).half().cuda().to(model.device)
-            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    inputs=input_ids.to(model.device),
-                    attention_mask=attention_mask,
-                    images=image_tensor,
-                    image_sizes=[image.size],
-                    do_sample=True,
-                    temperature=0.2,
-                    top_p=None,
-                    num_beams=1,
-                    max_new_tokens=256,
-                    use_cache=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
+#     else:
+#         prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Explain your current intent: """
 
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-            return outputs
-        
-def SceneDescription(image_path, processor=None, model=None, tokenizer=None, args=None):
-    prompt = f"""You are a autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Describe the driving scene according to weather, traffic lights, movements of other cars or pedestrians and lane markings."""
+#     result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
 
-    result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-    return result
-
-def DescribeObjects(image_path, processor=None, model=None, tokenizer=None, args=None):
-
-    prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. What other road users should you pay attention to in the driving scene? List two or three of them, specifying its location within the image of the driving scene and provide a short description of the that road user on what it is doing, and why it is important to you."""
-
-    result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-
-    return result
-
-def DescribeOrUpdateIntent(image_path, prev_intent=None, processor=None, model=None, tokenizer=None, args=None):
-
-    if prev_intent is None:
-        prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Based on the lane markings and the movement of other cars and pedestrians, describe the desired intent of the ego car. Is it going to follow the lane to turn left, turn right, or go straight? Should it maintain the current speed or slow down or speed up?"""
-
-    else:
-        prompt = f"""You are a autonomous driving labeller. You have access to a front-view camera images of a vehicle taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Half a second ago your intent was to {prev_intent}. Based on the updated lane markings and the updated movement of other cars and pedestrians, do you keep your intent or do you change it? Explain your current intent: """
-
-    result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-
-    return result
-
-
-def GenerateMotion(image_path, obs_velocities, obs_curvatures, given_intent, processor=None, model=None, tokenizer=None, args=None):
-    scene_description, object_description, intent_description = None, None, None
-
-    if args.method == "openemma":
-        scene_description = SceneDescription(image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        object_description = DescribeObjects(image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        intent_description = DescribeOrUpdateIntent(image_path, prev_intent=given_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        print(f'Scene Description: {scene_description}')
-        print(f'Object Description: {object_description}')
-        print(f'Intent Description: {intent_description}')
-
-    obs_velocities_norm = np.linalg.norm(obs_velocities, axis=1)
-    obs_curvatures = obs_curvatures * 100
-    obs_speed_curvature_str = [f"[{x[0]:.1f},{x[1]:.1f}]" for x in zip(obs_velocities_norm, obs_curvatures)]
-    obs_speed_curvature_str = ", ".join(obs_speed_curvature_str)
-
-    
-    print(f'Observed Speed and Curvature: {obs_speed_curvature_str}')
-
-    if args.method == "openemma":
-        prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The scene is described as follows: {scene_description}. 
-        The identified critical objects are {object_description}. 
-        The car's intent is {intent_description}. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
-    else:
-        prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
-        The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
-    for rho in range(3):
-        result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
-        if not "unable" in result and not "sorry" in result and "[" in result:
-            break
-    return result, scene_description, object_description, intent_description
+#     return result
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -181,43 +80,9 @@ if __name__ == '__main__':
     model = None    #Before Loading Clean state, No leftover memory, Safe fallback if a model isn’t loaded
     processor = None
     tokenizer = None
-    try:
-        # Loading Qwen2.5-VL-3B-Instruct，flash attention
-        if "qwen" in args.model_path or "Qwen" in args.model_path:
-            try:
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    "/kaggle/working/qwen2.5-vl-3b-fixed/",
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation="sdpa",
-                    device_map="auto"
-                )
-                processor = AutoProcessor.from_pretrained("/kaggle/working/qwen2.5-vl-3b-fixed/", 
-                                                          use_fast=False)
-                tokenizer = None
-                print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-            except Exception as e:
-                    import traceback
-                    print("Qwen2.5-VL-3B-Instruct failed")
-                    traceback.print_exc()
-            #     print("loading Qwen2-VL-7B-Instruct。")
-            #     model = Qwen2VLForConditionalGeneration.from_pretrained(
-            #         "Qwen/Qwen2-VL-7B-Instruct",
-            #         dtype=torch.bfloat16,
-            #         attn_implementation="sdpa",
-            #         device_map="auto"
-            #     )
-            #     processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-            #     tokenizer = None
-            #     print("Successfully loaded Qwen2-VL-7B-Instruct。")
-        elif "llava" in args.model_path:
-            disable_torch_init() 
-            tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
-            tokenizer.pad_token = tokenizer.eos_token 
-            model.config.pad_token_id = tokenizer.pad_token_id
-            model = model.half()
-            model.eval()
-    except Exception as e:
-        print("Exception:", e)
+    model = build_openemma_tinyvla("path/to/your/trained/openemma_tinyvla_checkpoint").cuda().eval()
+    tokenizer = AutoTokenizer.from_pretrained("path/to/your/trained/openemma_tinyvla_checkpoint")
+    image_processor = CLIPImageProcessor.from_pretrained("path/to/your/trained/openemma_tinyvla_checkpoint")
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     timestamp = args.model_path + f"_results/{args.method}/" + timestamp
@@ -326,22 +191,9 @@ if __name__ == '__main__':
             img = cv2.imread(current_image)
             img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
 
-            for _ in range(3):
-                (prediction,
-                scene_description,
-                object_description,
-                updated_intent) = GenerateMotion(current_image, obs_ego_velocities,
-                                                obs_ego_curvatures, prev_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
-
-                # Process the output.
-                prev_intent = updated_intent  # Stateful intent
-                pred_waypoints = prediction.replace("Future speeds and curvatures:", "").strip()
-                coordinates = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", pred_waypoints)
-                if not coordinates == []:
-                    break
-            if coordinates == []:
-                continue
-            speed_curvature_pred = [[float(v), float(k)] for v, k in coordinates]
+            prev_intent = describe_or_update_intent(current_image, prev_intent)   # still text, from Part 4's helper
+            speed_curvature_pred = predict_step(current_image, obs_ego_velocities, obs_ego_curvatures,
+                                                prev_intent, model, tokenizer, image_processor)
             speed_curvature_pred = speed_curvature_pred[:10]
             print(f"Got {len(speed_curvature_pred)} future actions: {speed_curvature_pred}")
 
