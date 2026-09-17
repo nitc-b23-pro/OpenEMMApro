@@ -13,15 +13,12 @@ from nuscenes import NuScenes
 import json
 from openemma.YOLO3D.inference import yolo3d_nuScenes
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration, Qwen2_5_VLForConditionalGeneration
-from PIL import Image
-from qwen_vl_utils import process_vision_info
 
-from llava.model.builder import load_pretrained_model
-from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IMAGE_PLACEHOLDER
-from llava.utils import disable_torch_init
-from llava.mm_utils import tokenizer_image_token, process_images
-from llava.conversation import conv_templates
+from PIL import Image
+
+from build_model import build_llava_pythia
+from llava_pythia_inference import llava_pythia_generate
+from transformers import AutoTokenizer, CLIPImageProcessor
 
 OBS_LEN = 10
 FUT_LEN = 10
@@ -35,74 +32,8 @@ def get_message(prompt, image):
 
 
 def vlm_inference(text, image_path, processor, model, tokenizer, args):
-        if "qwen" in args.model_path.lower():
-            message = get_message(text, image_path)
-            text = processor.apply_chat_template(
-                message, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, video_inputs = process_vision_info(message)
-            inputs = processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt",
-            ).to(model.device)
-            generated_ids = model.generate(**inputs, max_new_tokens=128)
-            generated_ids_trimmed = [
-                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-            ]
-            output_text = processor.batch_decode(
-                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-            )
-            return output_text[0]
-        elif "llava" in args.model_path.lower():
-            conv_mode = "mistral_instruct"
-            image_token_se = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-
-            if IMAGE_PLACEHOLDER in text:
-                if model.config.mm_use_im_start_end:
-                    text = re.sub(IMAGE_PLACEHOLDER, image_token_se, text)
-                else:
-                    text = re.sub(IMAGE_PLACEHOLDER, DEFAULT_IMAGE_TOKEN, text)
-            else:
-                if model.config.mm_use_im_start_end:
-                    text = image_token_se + "\n" + text
-                else:
-                    text = DEFAULT_IMAGE_TOKEN + "\n" + text
-
-            conv = conv_templates[conv_mode].copy()
-            conv.append_message(conv.roles[0], text)
-            conv.append_message(conv.roles[1], None)
-            prompt = conv.get_prompt()
-
-            input_ids = tokenizer_image_token(
-                prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt'
-            ).unsqueeze(0).cuda()
-
-            image = Image.open(image_path).convert('RGB')
-
-            image_tensor = process_images([image], processor, model.config)[0]
-
-            image_tensor = image_tensor.unsqueeze(0).half().cuda().to(model.device)
-            attention_mask = (input_ids != tokenizer.pad_token_id).long().to(model.device)
-            with torch.inference_mode():
-                output_ids = model.generate(
-                    inputs=input_ids.to(model.device),
-                    attention_mask=attention_mask,
-                    images=image_tensor,
-                    image_sizes=[image.size],
-                    do_sample=True,
-                    temperature=0.2,
-                    top_p=None,
-                    num_beams=1,
-                    max_new_tokens=256,
-                    use_cache=True,
-                    pad_token_id=tokenizer.eos_token_id,
-                )
-
-            outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
-            return outputs
+    output_text = llava_pythia_generate(text, image_path, model, tokenizer, processor)
+    return output_text
         
 def SceneDescription(image_path, processor=None, model=None, tokenizer=None, args=None):
     prompt = f"""You are a autonomous driving labeller. You have access to these front-view camera images of a car taken at a 0.5 second interval over the past 5 seconds. Imagine you are driving the car. Describe the driving scene according to weather, traffic lights, movements of other cars or pedestrians and lane markings."""
@@ -182,40 +113,9 @@ if __name__ == '__main__':
     processor = None
     tokenizer = None
     try:
-        # Loading Qwen2.5-VL-3B-Instruct，flash attention
-        if "qwen" in args.model_path or "Qwen" in args.model_path:
-            try:
-                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    "/kaggle/working/qwen2.5-vl-3b-fixed/",
-                    torch_dtype=torch.bfloat16,
-                    attn_implementation="sdpa",
-                    device_map="auto"
-                )
-                processor = AutoProcessor.from_pretrained("/kaggle/working/qwen2.5-vl-3b-fixed/", 
-                                                          use_fast=False)
-                tokenizer = None
-                print("Successfully loaded Qwen2.5-VL-3B-Instruct with flash attention。")
-            except Exception as e:
-                    import traceback
-                    print("Qwen2.5-VL-3B-Instruct failed")
-                    traceback.print_exc()
-            #     print("loading Qwen2-VL-7B-Instruct。")
-            #     model = Qwen2VLForConditionalGeneration.from_pretrained(
-            #         "Qwen/Qwen2-VL-7B-Instruct",
-            #         dtype=torch.bfloat16,
-            #         attn_implementation="sdpa",
-            #         device_map="auto"
-            #     )
-            #     processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-7B-Instruct")
-            #     tokenizer = None
-            #     print("Successfully loaded Qwen2-VL-7B-Instruct。")
-        elif "llava" in args.model_path:
-            disable_torch_init() 
-            tokenizer, model, processor, context_len = load_pretrained_model("models/llava-v1.6-mistral-7b", None, "llava-v1.6-mistral-7b", device="cuda", device_map="auto")
-            tokenizer.pad_token = tokenizer.eos_token 
-            model.config.pad_token_id = tokenizer.pad_token_id
-            model = model.half()
-            model.eval()
+        model = build_llava_pythia("path/to/your/llava_pythia_checkpoint").cuda().eval()
+        tokenizer = AutoTokenizer.from_pretrained("path/to/your/llava_pythia_checkpoint")
+        processor = CLIPImageProcessor.from_pretrained("path/to/your/llava_pythia_checkpoint")
     except Exception as e:
         print("Exception:", e)
 

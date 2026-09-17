@@ -70,7 +70,10 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
             self.num_queries = config.chunk_size
             self.noise_samples = 1
             self.num_inference_timesteps = 10
-
+            
+        elif config.action_head_type == 'fc':
+            self.embed_out = nn.Linear(config.hidden_size, config.vocab_size)
+            
         self.post_init()
 
     def get_channel_proj(self, x):
