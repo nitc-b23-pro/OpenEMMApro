@@ -48,8 +48,33 @@ model = build_openemma_tinyvla(PRETRAINED).cuda()
 tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
 image_processor = CLIPImageProcessor.from_pretrained(PRETRAINED)
 
+# ADDED (OOM mitigation): step 0's forward+backward+optimizer.step() alone used
+# ~14.17 GiB of the card's 14.56 GiB, then OOM'd on step 1's forward pass.
+# AdamW allocates its exp_avg/exp_avg_sq state (2x extra memory per trainable
+# param) LAZILY, on the first optimizer.step() call -- so step 0 runs under a
+# "no optimizer state yet" budget that step 1 never gets again. Gradient
+# checkpointing trades compute for memory: instead of keeping every
+# transformer layer's activations around for backward, it recomputes them
+# on the fly, which cuts backward-pass memory substantially for a model this
+# size. `enable_input_require_grads()` is the standard companion call needed
+# when combining gradient checkpointing with a model whose input embeddings
+# are frozen (as they are here, apart from LoRA) -- without it, checkpointing
+# can silently stop gradients from flowing back through the LoRA-adapted
+# layers at all.
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
+
 dataset = OpenEMMADataset(dataroot=DATAROOT, version=VERSION)   # reads datasets/NuScenes, no intents_cache.json any more
-loader = DataLoader(dataset, batch_size=4, shuffle=True)
+# CHANGED (OOM mitigation): batch_size 4 -> 2. Per-step activation memory
+# scales ~linearly with batch size, and this is the single biggest lever
+# available without touching model architecture. GRAD_ACCUM_STEPS=2 below
+# accumulates gradients over 2 micro-batches of size 2 before every
+# optimizer.step(), so the *effective* batch size the model trains at (and
+# the LoRA/head learning rates were tuned for) stays 4 -- only the peak
+# memory of any single forward/backward drops.
+BATCH_SIZE = 2
+GRAD_ACCUM_STEPS = 2
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Two learning rates, exactly like TinyVLA's original recipe:
 #   - a small one for the LoRA "patches" on the pretrained VLM (don't want to move it far)
@@ -87,6 +112,8 @@ EPOCHS = 5
 global_frame_count = 0
 total_process_time = 0.0
 
+optimizer.zero_grad()
+
 for epoch in range(EPOCHS):
     print(f"Epoch {epoch} running...!")
     for step, batch in enumerate(loader):
@@ -101,9 +128,34 @@ for epoch in range(EPOCHS):
                     actions=action, is_pad=is_pad)
         loss = out["loss"] if isinstance(out, dict) else out.loss
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        # ADDED (loss=nan guard): if a NaN/Inf loss still slips through
+        # despite the curvature clip in utils.py (belt-and-suspenders --
+        # there could be other degenerate samples we haven't seen yet),
+        # NEVER call .backward()/optimizer.step() on it. AdamW's exp_avg /
+        # exp_avg_sq are *cumulative* running averages -- one NaN gradient
+        # poisons that state permanently, and every future update for that
+        # parameter is NaN forever after, even once the bad batch is long
+        # gone. Skipping the step (but not the frame-timing bookkeeping)
+        # costs one batch of training and keeps the run alive; the printed
+        # diagnostics show exactly which raw state/action values triggered
+        # it, in case the clip needs to be tightened further.
+        loss_is_finite = torch.isfinite(loss)
+        if not loss_is_finite:
+            print(f"epoch {epoch} step {step} | SKIPPED (loss={loss.item()}) | "
+                  f"state min/max={state.min().item():.3f}/{state.max().item():.3f} | "
+                  f"action min/max={action.min().item():.3f}/{action.max().item():.3f}")
+            optimizer.zero_grad()
+        else:
+            # CHANGED (OOM mitigation, gradient accumulation): normalize by
+            # GRAD_ACCUM_STEPS so the accumulated gradient over
+            # GRAD_ACCUM_STEPS micro-batches matches the scale a single
+            # batch_size=4 step would have produced -- this is what keeps
+            # the effective batch size (and the tuned learning rates) at 4
+            # even though each micro-batch here is only size 2.
+            (loss / GRAD_ACCUM_STEPS).backward()
+            if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                optimizer.step()
+                optimizer.zero_grad()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()

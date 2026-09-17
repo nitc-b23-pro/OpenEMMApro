@@ -270,6 +270,32 @@ def EstimateCurvatureFromTrajectory(traj):
     curvature[0] = curvature[1]
     curvature[-1] = curvature[-2]
 
+    # ADDED (loss=nan fix): the "L1>0 and L2>0 and L3>0" guard above only
+    # rules out an EXACT zero division (the car reporting the identical
+    # position twice in a row). It does NOT guard against L1/L2/L3 being
+    # nonzero but extremely small -- which happens constantly in real
+    # driving logs: a car stopped at a light or crawling in traffic moves
+    # by sub-centimeter amounts between 0.5s samples, and that tiny motion
+    # is dominated by localization noise/quantization rather than real
+    # curvature. Because curvature = 4*area/(L1*L2*L3) has L1*L2*L3 in the
+    # denominator, these near-zero (not zero) arc lengths can blow the
+    # result up to enormous finite values (10^3-10^6+) for what is
+    # physically a straight, stationary, or near-stationary vehicle.
+    # Downstream, openemma_dataset.py multiplies this by 100 and feeds it
+    # in as both the diffusion head's raw "states" conditioning and its
+    # "actions" regression target -- a single huge value there is enough
+    # to blow the ConditionalUnet1D's GroupNorm/FiLM activations up to inf,
+    # and inf * 0 (e.g. at a zero-padded conv boundary, or a masked
+    # timestep) becomes NaN. That is almost certainly the exact mechanism
+    # behind the loss=nan seen on step 0 of training.
+    #
+    # Real vehicle curvature (1 / turning-radius-in-meters) essentially
+    # never exceeds ~0.5 1/m even in a tight parking-lot turn, so clipping
+    # to a generous +-2.0 1/m band removes this sensor-noise artifact while
+    # leaving every physically real curve completely untouched.
+    CURVATURE_CLIP = 2.0
+    curvature = np.clip(curvature, -CURVATURE_CLIP, CURVATURE_CLIP)
+
     return curvature
 
 def IntegrateCurvatureForPoints(
