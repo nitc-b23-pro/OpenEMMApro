@@ -72,7 +72,19 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
             self.num_inference_timesteps = 10
             
         elif config.action_head_type == 'fc':
-            self.embed_out = nn.Linear(config.hidden_size, config.vocab_size)
+            class _TextHead(nn.Module):
+                """Wraps a plain vocab-projection Linear so its forward() accepts the
+                same input_feature / state_tensor keywords every other head in this
+                file expects. state_tensor is unused here -- plain text mode has no
+                use for the numeric state, we just accept and ignore it."""
+                def __init__(self, hidden_size, vocab_size):
+                    super().__init__()
+                    self.linear = nn.Linear(hidden_size, vocab_size)
+
+                def forward(self, input_feature, state_tensor=None):
+                    return self.linear(input_feature)
+
+            self.embed_out = _TextHead(config.hidden_size, config.vocab_size)
             
         self.post_init()
 
