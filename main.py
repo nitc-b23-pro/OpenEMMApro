@@ -94,6 +94,7 @@ def GenerateMotion(image_path, obs_velocities, obs_curvatures, given_intent, pro
         Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
     for rho in range(3):
         result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
+        print("Result: ", result)
         if not "unable" in result and not "sorry" in result and "[" in result:
             break
     return result, scene_description, object_description, intent_description
