@@ -87,11 +87,15 @@ def GenerateMotion(image_path, obs_velocities, obs_curvatures, given_intent, pro
         The identified critical objects are {object_description}. 
         The car's intent is {intent_description}. 
         The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+        Infer the association between these numbers and the image sequence, then predict what the NEXT 10 speed and curvature values will be, half a second apart. 
+        Answer with exactly 10 comma-separated pairs, each written as [speed,curvature] using real numbers you infer from the image and the trend in the history above -- for example a well-formed answer looks like [7.1,0.05], [6.9,0.08], [6.8,0.10], [6.6,0.12], [6.5,0.11], [6.5,0.09], [6.6,0.07], [6.8,0.05], [7.0,0.03], [7.2,0.02] (those exact numbers are only a formatting example, not your answer). 
+        Do not output the words speed_1, curvature_1, etc, do not repeat the historical values above, and do not include any other words. Future speeds and curvatures:"""
     else:
         prompt = f"""These are frames from a video taken by a camera mounted in the front of a car. The images are taken at a 0.5 second interval. 
         The 5 second historical velocities and curvatures of the ego car are {obs_speed_curvature_str}. 
-        Infer the association between these numbers and the image sequence. Generate the predicted future speeds and curvatures in the format [speed_1, curvature_1], [speed_2, curvature_2],..., [speed_10, curvature_10]. Write the raw text not markdown or latex. Future speeds and curvatures:"""
+        Infer the association between these numbers and the image sequence, then predict what the NEXT 10 speed and curvature values will be, half a second apart. 
+        Answer with exactly 10 comma-separated pairs, each written as [speed,curvature] using real numbers you infer from the image and the trend in the history above -- for example a well-formed answer looks like [7.1,0.05], [6.9,0.08], [6.8,0.10], [6.6,0.12], [6.5,0.11], [6.5,0.09], [6.6,0.07], [6.8,0.05], [7.0,0.03], [7.2,0.02] (those exact numbers are only a formatting example, not your answer). 
+        Do not output the words speed_1, curvature_1, etc, do not repeat the historical values above, and do not include any other words. Future speeds and curvatures:"""
     for rho in range(3):
         result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
         print("Result: ", result)
