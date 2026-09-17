@@ -113,9 +113,9 @@ if __name__ == '__main__':
     processor = None
     tokenizer = None
     try:
-        model = build_llava_pythia("/kaggle/input/models/karthickpoondla2/llava-pythia/transformers/s/1/").cuda().eval()
-        tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/models/karthickpoondla2/llava-pythia/transformers/s/1/")
-        processor = CLIPImageProcessor.from_pretrained("/kaggle/input/models/karthickpoondla2/llava-pythia/transformers/s/1/")
+        model = build_llava_pythia("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/").cuda().eval()
+        tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
+        processor = CLIPImageProcessor.from_pretrained("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
     except Exception as e:
         print("Exception:", e)
 
