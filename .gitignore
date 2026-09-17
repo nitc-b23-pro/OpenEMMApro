@@ -20,7 +20,6 @@ env/
 # Project specific
 /gpt_results/
 /data/
-/models/
 main_kh.py
 /qwen_results/
 /llava_results/
