@@ -127,6 +127,34 @@ def build_openemma_tinyvla(pretrained_path, trained_checkpoint_path=None):
         for name, param in model.named_parameters():
             if param.requires_grad:
                 param.data = param.data.float()
+
+        # ADDED (loss=nan investigation, checkpoint #0): every training step so
+        # far has produced a noise_pred tensor that is 100% NaN -- not a few
+        # extreme values, ALL of them, from the very first forward pass before
+        # any training has happened. That pattern (unconditional, from step 0,
+        # regardless of how ordinary the input data is) smells like the
+        # diffusion head's weights are ALREADY corrupted right out of
+        # __init__/post_init(), before a single batch is ever seen -- rather
+        # than a computation that corrupts otherwise-clean weights during the
+        # forward pass. This checks that directly, once, at model-build time:
+        # if any embed_out/proj_to_action parameter is already NaN/Inf here,
+        # we've found the actual bug (almost certainly in how
+        # LlavaPythiaForCausalLM.post_init() re-initializes this module, since
+        # post_init() runs its generic HF weight-init AFTER ConditionalUnet1D's
+        # own __init__ already gave every layer sane values). If nothing
+        # prints here, the weights start clean and the corruption is
+        # happening during the forward pass itself instead.
+        bad_params = []
+        for name, param in model.named_parameters():
+            if ("embed_out" in name or "proj_to_action" in name) and not torch.isfinite(param).all():
+                bad_params.append(name)
+        if bad_params:
+            print(f"[NaN DEBUG] {len(bad_params)} embed_out/proj_to_action parameter(s) "
+                  f"are ALREADY non-finite immediately after model construction "
+                  f"(before any forward pass): {bad_params}")
+        else:
+            print("[NaN DEBUG] all embed_out/proj_to_action parameters are finite "
+                  "immediately after model construction.")
     else:
         # Loading a checkpoint YOU already trained: load the SAVED LoRA
         # weights + SAVED diffusion head weights from trained_checkpoint_path
