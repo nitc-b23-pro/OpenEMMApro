@@ -22,12 +22,31 @@ def build_llava_pythia(pretrained_path, torch_dtype=torch.float16):
 
     # Load in fp16 by default -- on a 14-15GB Kaggle T4, an H (1.3B) checkpoint
     # plus the CLIP vision tower plus YOLO3D easily eats the whole card in fp32.
-    # Halving the weight footprint here is the cheapest way to buy back headroom
-    # without touching the manual, no-KV-cache generation loop.
-    model = LlavaPythiaForCausalLM.from_pretrained(
-        pretrained_path,
-        config=config,
-        torch_dtype=torch_dtype
-    )
+    # Halving the weight footprint here is the cheapest way to buy back headroom.
+    #
+    # attn_implementation="sdpa": your Qwen loading code (see
+    # assests/openemma_tinyvla_guide.md's precompute_intents.py) explicitly used
+    # attn_implementation="sdpa" for fast fused attention kernels. build_model.py
+    # never set this for LLaVA-Pythia's GPTNeoX backbone, so it was likely
+    # falling back to plain eager attention -- a real, independent source of
+    # per-step slowness on top of the missing KV-cache. Try sdpa first; some
+    # older transformers/custom-model combinations don't accept the kwarg
+    # cleanly for a non-standard AutoModel-registered class, so fall back to
+    # the default (eager) rather than crashing the whole run over this.
+    try:
+        model = LlavaPythiaForCausalLM.from_pretrained(
+            pretrained_path,
+            config=config,
+            torch_dtype=torch_dtype,
+            attn_implementation="sdpa",
+        )
+    except (TypeError, ValueError) as e:
+        print(f"[build_model] attn_implementation='sdpa' not accepted ({e!r}); "
+              f"loading with default (eager) attention instead.")
+        model = LlavaPythiaForCausalLM.from_pretrained(
+            pretrained_path,
+            config=config,
+            torch_dtype=torch_dtype,
+        )
 
     return model

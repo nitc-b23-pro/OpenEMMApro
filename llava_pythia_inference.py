@@ -36,6 +36,7 @@ the cached path will raise, and this falls back to the old, slow, always-
 correct-but-much-slower recompute-everything loop rather than silently
 producing wrong output.
 """
+import time
 import torch
 from PIL import Image
 from llava_pythia.mm_utils import tokenizer_image_token
@@ -134,9 +135,17 @@ def llava_pythia_generate(prompt_text, image_path, model, tokenizer, image_proce
     # the token the model was trained to emit at the end of its ASSISTANT turn.
     eos_id = tokenizer.eos_token_id
 
+    # DIAGNOSTIC (temporary, keep until we have real numbers): time every call
+    # and report which decode path actually ran. torch.cuda.synchronize() makes
+    # the timing honest -- CUDA calls are async, so without it you'd mostly be
+    # timing how fast Python can enqueue work, not how long the GPU took.
+    torch.cuda.synchronize()
+    t0 = time.time()
+    path_used = "cached"
     try:
         new_tokens = _generate_with_cache(input_ids, image_tensor, model, eos_id, max_new_tokens)
     except Exception as e:
+        path_used = "fallback (no cache)"
         if not _warned:
             print(f"[llava_pythia_generate] Cached decoding failed ({e!r}); "
                   f"falling back to the slow no-cache loop for the rest of this run. "
@@ -144,5 +153,10 @@ def llava_pythia_generate(prompt_text, image_path, model, tokenizer, image_proce
                   f"Cache object instead of a legacy tuple for past_key_values.")
             _warned.append(True)
         new_tokens = _generate_slow_no_cache(input_ids, image_tensor, model, eos_id, max_new_tokens)
+    torch.cuda.synchronize()
+    elapsed = time.time() - t0
+    n_tokens = new_tokens.shape[1]
+    print(f"[llava_pythia_generate] path={path_used} tokens={n_tokens} "
+          f"time={elapsed:.2f}s ({elapsed / max(n_tokens, 1) * 1000:.1f} ms/token)")
 
     return tokenizer.decode(new_tokens[0], skip_special_tokens=True)
