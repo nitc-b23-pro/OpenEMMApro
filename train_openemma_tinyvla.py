@@ -72,7 +72,14 @@ def preprocess_batch(batch):
     max_len = max(x.shape[0] for x in input_ids_list)
     padded = torch.stack([torch.nn.functional.pad(x, (0, max_len - x.shape[0]), value=tokenizer.pad_token_id)
                            for x in input_ids_list])
-    return padded.cuda(), torch.stack(images_list).cuda()
+    # FIXED (dtype mismatch): build_model.py now loads the base VLM (including
+    # mm_projector, which is plain nn.Linear -- not LoRA-adapted, so there is
+    # no PEFT-level dtype auto-casting protecting it) in fp16. CLIPVisionTower's
+    # own forward() casts its OUTPUT back to match whatever dtype the INPUT
+    # image tensor was, so if we hand it fp32 here, mm_projector (fp16 weights)
+    # gets an fp32 input and F.linear crashes on the dtype mismatch. Casting to
+    # fp16 here makes that round-trip land on fp16, matching mm_projector.
+    return padded.cuda(), torch.stack(images_list).cuda().half()
 
 EPOCHS = 5
 

@@ -56,7 +56,12 @@ def predict_step(image_path, obs_velocities, obs_curvatures,
                                        return_tensors="pt").unsqueeze(0).cuda()
 
     img = Image.open(image_path).convert("RGB")
-    image_tensor = image_processor.preprocess(img, return_tensors="pt")["pixel_values"].cuda()
+    # FIXED (dtype mismatch, same root cause as train_openemma_tinyvla.py's
+    # preprocess_batch(): build_model.py loads the base VLM -- including
+    # mm_projector, plain nn.Linear with no LoRA/PEFT dtype auto-casting -- in
+    # fp16. CLIPVisionTower casts its output back to match whatever dtype the
+    # input image tensor was, so it must already be fp16 here.
+    image_tensor = image_processor.preprocess(img, return_tensors="pt")["pixel_values"].cuda().half()
 
     with torch.inference_mode():
         # eval=True triggers the diffusion "sculptor" loop instead of text generation --

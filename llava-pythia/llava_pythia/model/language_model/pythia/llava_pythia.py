@@ -326,6 +326,19 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
                 - If training, returns a dictionary containing the MSE loss.
                 - If inference, returns the predicted actions.
         """
+        # FIXED (dtype mismatch): the base LLM is loaded in fp16 (see
+        # build_model.py), so `hidden_states` arrives here as fp16. But
+        # `embed_out` (this diffusion head's own norm_after_pool / combine /
+        # ConditionalUnet1D layers) is explicitly upcast to fp32 in
+        # build_model.py, precisely because the actively-trained head needs
+        # fp32 stability. Feeding it fp16 hidden_states hits the exact same
+        # "mat1 and mat2 must have the same dtype" failure that mm_projector
+        # did before its own input was cast to match -- upcasting once here
+        # covers every use of hidden_states below (norm_after_pool, combine,
+        # and every embed_out(...) call in both the training and inference
+        # branches).
+        hidden_states = hidden_states.float()
+
         if actions is not None:  # training time
             B = actions.size(0)
             actions = actions[:, :self.num_queries]
