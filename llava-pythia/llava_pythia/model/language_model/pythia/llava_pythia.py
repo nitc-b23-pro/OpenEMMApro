@@ -204,7 +204,16 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
             logits = None
         elif self.head_type == 'droid_diffusion':
             if not eval:
-                loss = self.forward_diffusion_head(actions, hidden_states, states, is_pad)
+                # FIXED: forward_diffusion_head's training branch returns a
+                # dict ({'loss': loss_tensor}), not the raw tensor. Assigning
+                # it straight to `loss` here meant CausalLMOutputWithPast.loss
+                # (itself an OrderedDict-like ModelOutput) held a dict-inside-
+                # a-dict, so `out["loss"]`/`out.loss` in the training script
+                # returned that inner dict rather than a tensor, and
+                # loss.backward() failed with "'dict' object has no attribute
+                # 'backward'". Unwrapping ['loss'] here gives callers the
+                # actual scalar tensor, as every other head_type branch does.
+                loss = self.forward_diffusion_head(actions, hidden_states, states, is_pad)['loss']
                 logits = None
             else:
                 action = self.forward_diffusion_head(actions, hidden_states, states, is_pad)
