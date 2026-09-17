@@ -183,8 +183,18 @@ class ConditionalUnet1D(nn.Module):
         self.combine = nn.Linear(global_cond_dim + state_dim, global_cond_dim)
 
         dsed = diffusion_step_embed_dim
+        # FIXED (dtype mismatch): this was hardcoded to torch.bfloat16,
+        # independent of every other layer in this module. That was harmless
+        # as long as the rest of embed_out matched it, but build_model.py now
+        # explicitly upcasts embed_out (this whole ConditionalUnet1D) to fp32
+        # for training stability, so this one hardcoded sub-module was left
+        # out of step -- its bfloat16 output fed straight into the fp32
+        # nn.Linear right after it, which is exactly the same class of "mat1
+        # and mat2 must have the same dtype" crash as the mm_projector and
+        # hidden_states fixes elsewhere. torch.float32 matches everything
+        # else in this module now.
         diffusion_step_encoder = nn.Sequential(
-            SinusoidalPosEmb(dsed, torch.bfloat16),
+            SinusoidalPosEmb(dsed, torch.float32),
             nn.Linear(dsed, dsed * 4),
             nn.Mish(),
             nn.Linear(dsed * 4, dsed),
