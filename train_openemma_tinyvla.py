@@ -124,38 +124,64 @@ for epoch in range(EPOCHS):
         action = batch["action"].cuda()    # (B, 10, 2) -- GT future trajectories (diffusion regression target)
         is_pad = batch["is_pad"].cuda()    # (B, 10)
 
-        out = model(input_ids=input_ids, images=images, states=state,
-                    actions=action, is_pad=is_pad)
-        loss = out["loss"] if isinstance(out, dict) else out.loss
+        # ADDED (OOM survivability across the WHOLE run, not just step 0->1):
+        # the step-0->step-1 crash was a ONE-TIME jump -- AdamW allocates
+        # exp_avg/exp_avg_sq once, on the first optimizer.step(), and that
+        # memory is reused in place forever after, it does not keep growing
+        # every step. So that specific mechanism cannot repeat later in
+        # training. But total memory per step is NOT perfectly flat for the
+        # rest of the run either: preprocess_batch() pads input_ids to the
+        # LONGEST prompt in each specific batch (dynamic padding), so a
+        # batch that happens to draw a longer raw_lang text needs more
+        # activation memory than average; over thousands of steps across 5
+        # epochs, plus ordinary CUDA allocator fragmentation (expandable_
+        # segments helps but doesn't guarantee zero), a rare step can still
+        # spike close to the ceiling this GPU is already running near. A
+        # crash on step 4000 of 5 would otherwise lose the rest of that
+        # epoch's progress. So: catch the OOM, free what we can, skip just
+        # that one micro-batch, and keep the run alive -- this is a safety
+        # net for rare spikes, not a fix for a batch size that's
+        # structurally too big (if EVERY step OOMs, skipping won't help).
+        try:
+            out = model(input_ids=input_ids, images=images, states=state,
+                        actions=action, is_pad=is_pad)
+            loss = out["loss"] if isinstance(out, dict) else out.loss
 
-        # ADDED (loss=nan guard): if a NaN/Inf loss still slips through
-        # despite the curvature clip in utils.py (belt-and-suspenders --
-        # there could be other degenerate samples we haven't seen yet),
-        # NEVER call .backward()/optimizer.step() on it. AdamW's exp_avg /
-        # exp_avg_sq are *cumulative* running averages -- one NaN gradient
-        # poisons that state permanently, and every future update for that
-        # parameter is NaN forever after, even once the bad batch is long
-        # gone. Skipping the step (but not the frame-timing bookkeeping)
-        # costs one batch of training and keeps the run alive; the printed
-        # diagnostics show exactly which raw state/action values triggered
-        # it, in case the clip needs to be tightened further.
-        loss_is_finite = torch.isfinite(loss)
-        if not loss_is_finite:
-            print(f"epoch {epoch} step {step} | SKIPPED (loss={loss.item()}) | "
-                  f"state min/max={state.min().item():.3f}/{state.max().item():.3f} | "
-                  f"action min/max={action.min().item():.3f}/{action.max().item():.3f}")
-            optimizer.zero_grad()
-        else:
-            # CHANGED (OOM mitigation, gradient accumulation): normalize by
-            # GRAD_ACCUM_STEPS so the accumulated gradient over
-            # GRAD_ACCUM_STEPS micro-batches matches the scale a single
-            # batch_size=4 step would have produced -- this is what keeps
-            # the effective batch size (and the tuned learning rates) at 4
-            # even though each micro-batch here is only size 2.
-            (loss / GRAD_ACCUM_STEPS).backward()
-            if (step + 1) % GRAD_ACCUM_STEPS == 0:
-                optimizer.step()
+            # ADDED (loss=nan guard): if a NaN/Inf loss still slips through
+            # despite the curvature clip in utils.py (belt-and-suspenders --
+            # there could be other degenerate samples we haven't seen yet),
+            # NEVER call .backward()/optimizer.step() on it. AdamW's exp_avg /
+            # exp_avg_sq are *cumulative* running averages -- one NaN gradient
+            # poisons that state permanently, and every future update for that
+            # parameter is NaN forever after, even once the bad batch is long
+            # gone. Skipping the step (but not the frame-timing bookkeeping)
+            # costs one batch of training and keeps the run alive; the printed
+            # diagnostics show exactly which raw state/action values triggered
+            # it, in case the clip needs to be tightened further.
+            loss_is_finite = torch.isfinite(loss)
+            if not loss_is_finite:
+                print(f"epoch {epoch} step {step} | SKIPPED (loss={loss.item()}) | "
+                      f"state min/max={state.min().item():.3f}/{state.max().item():.3f} | "
+                      f"action min/max={action.min().item():.3f}/{action.max().item():.3f}")
                 optimizer.zero_grad()
+            else:
+                # CHANGED (OOM mitigation, gradient accumulation): normalize by
+                # GRAD_ACCUM_STEPS so the accumulated gradient over
+                # GRAD_ACCUM_STEPS micro-batches matches the scale a single
+                # batch_size=4 step would have produced -- this is what keeps
+                # the effective batch size (and the tuned learning rates) at 4
+                # even though each micro-batch here is only size 2.
+                (loss / GRAD_ACCUM_STEPS).backward()
+                if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+        except torch.OutOfMemoryError as e:
+            print(f"epoch {epoch} step {step} | OOM, SKIPPING this micro-batch "
+                  f"(batch_size={input_ids.shape[0]}, padded_seq_len={input_ids.shape[1]}): {e}")
+            optimizer.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            continue
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()

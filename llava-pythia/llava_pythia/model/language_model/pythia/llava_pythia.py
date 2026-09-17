@@ -176,21 +176,56 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
-            input_ids, attention_mask, past_key_values, labels, images, images_r=images_r, images_top=images_top, visual_concat=self.visual_concat, states=states)
+        # ADDED (loss=nan investigation): the frozen backbone (CLIP vision
+        # tower + GPTNeoX text tower) is loaded hard-cast to fp16 (see
+        # build_model.py) purely to fit this ~1.3B-param model on a 14.56GiB
+        # Kaggle GPU. Running a checkpoint that was never calibrated for
+        # fp16 "raw" (no autocast) is a well-known source of silent inf/nan:
+        # fp16's dynamic range (~+-65504) is narrow enough that a handful of
+        # ops -- LayerNorm's variance, softmax over extreme logits, GELU/
+        # Mish on large activations -- can overflow partway through a deep
+        # stack of layers even when every individual weight looks fine.
+        # torch.autocast does NOT require fp32 "master" weights to help here:
+        # even over an already-fp16 model, autocast still forces its
+        # denylisted ops (layer_norm, softmax, and a handful of others) to
+        # run their internal math in fp32 by upcasting just their inputs for
+        # that one op, then downcasting the result back -- at basically zero
+        # extra memory cost, since only that op's activations are briefly
+        # widened, not the model's weights. This is a standard, low-risk
+        # hardening layer, not a fix that depends on knowing exactly which
+        # op was the culprit.
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels = self.prepare_inputs_labels_for_multimodal(
+                input_ids, attention_mask, past_key_values, labels, images, images_r=images_r, images_top=images_top, visual_concat=self.visual_concat, states=states)
 
-        outputs = self.get_model()(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict
-        )
+            outputs = self.get_model()(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict
+            )
 
         hidden_states = outputs[0]
+
+        # ADDED (loss=nan investigation): this is the exact boundary between
+        # the frozen backbone and the (trainable) action head. If
+        # hidden_states is already non-finite here, the NaN is coming from
+        # the backbone's own fp16 forward pass -- BEFORE the diffusion head,
+        # the diffusion process, or the curvature/state data have any
+        # chance to touch it. If it's clean here but the loss still comes
+        # out NaN, the bug is inside forward_diffusion_head/embed_out
+        # instead. This print is cheap (one .isfinite().all() reduction per
+        # forward pass) and settles that question directly instead of
+        # guessing further.
+        if not eval and not torch.isfinite(hidden_states).all():
+            print(f"[NaN DEBUG] hidden_states from backbone already non-finite: "
+                  f"nan_count={torch.isnan(hidden_states).sum().item()}, "
+                  f"inf_count={torch.isinf(hidden_states).sum().item()}, "
+                  f"shape={tuple(hidden_states.shape)}")
 
         if self.head_type == 'fc':
             loss, logits = self.forward_fc_head(labels, actions, hidden_states, states)
@@ -372,12 +407,37 @@ class LlavaPythiaForCausalLM(GPTNeoXPreTrainedModel, LlavaMetaForCausalLM):
             noisy_actions = noisy_actions.to(dtype=actions.dtype)
             assert hidden_states.ndim == 3
 
+            # ADDED (loss=nan investigation): checkpoint #2. If checkpoint #1
+            # (in forward(), right after the backbone) reported finite
+            # hidden_states but this one is non-finite, the corruption is
+            # happening in noise_scheduler.add_noise() -- i.e. in the DDPM
+            # forward diffusion process itself (its alphas_cumprod schedule,
+            # or actions containing an extreme raw value from the dataset
+            # that overflows once multiplied by sqrt_alpha_prod).
+            if not torch.isfinite(noisy_actions).all():
+                print(f"[NaN DEBUG] noisy_actions non-finite after add_noise: "
+                      f"actions min/max={actions.min().item():.3f}/{actions.max().item():.3f}, "
+                      f"noisy_actions nan_count={torch.isnan(noisy_actions).sum().item()}, "
+                      f"inf_count={torch.isinf(noisy_actions).sum().item()}")
+
             hidden_states = hidden_states.repeat(num_noise_samples, 1, 1)
             timesteps = timesteps.repeat(num_noise_samples)
             is_pad = is_pad.repeat(num_noise_samples, 1)
             states = states.repeat(num_noise_samples,  1)
 
             noise_pred = self.embed_out(noisy_actions, timesteps, global_cond=hidden_states, states=states)
+
+            # ADDED (loss=nan investigation): checkpoint #3. If checkpoints
+            # #1 and #2 were both finite but THIS is non-finite, the
+            # corruption is inside ConditionalUnet1D's own forward (embed_out)
+            # -- e.g. its GroupNorm/FiLM conditioning path -- rather than the
+            # backbone or the diffusion noise process.
+            if not torch.isfinite(noise_pred).all():
+                print(f"[NaN DEBUG] noise_pred non-finite from embed_out (ConditionalUnet1D): "
+                      f"nan_count={torch.isnan(noise_pred).sum().item()}, "
+                      f"inf_count={torch.isinf(noise_pred).sum().item()}, "
+                      f"states min/max={states.min().item():.3f}/{states.max().item():.3f}")
+
             noise = noise.view(noise.size(0) * noise.size(1), *noise.size()[2:])
             loss = torch.nn.functional.mse_loss(noise_pred, noise, reduction='none')
             loss = (loss * ~is_pad.unsqueeze(-1)).mean()
