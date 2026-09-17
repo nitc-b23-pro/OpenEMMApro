@@ -178,6 +178,15 @@ class ConditionalUnet1D(nn.Module):
         all_dims = [input_dim] + list(down_dims)
         start_dim = down_dims[0]
 
+        # FIXED (shape mismatch): this U-Net's down/up path only round-trips
+        # exactly when the action-horizon length (chunk_size, e.g. our
+        # project's 10 future timesteps) is a multiple of 2**(number of real
+        # downsample stages). len(down_dims)-1 stages actually downsample
+        # (the last stage is Identity -- see down_modules below), so that's
+        # 2**(len(down_dims)-1). forward() pads up to this multiple and crops
+        # back afterward, invisibly to every caller.
+        self.pad_multiple = 2 ** (len(down_dims) - 1)
+
         self.global_1d_pool = nn.AdaptiveAvgPool1d(1)
         self.norm_after_pool = nn.LayerNorm(global_cond_dim)
         self.combine = nn.Linear(global_cond_dim + state_dim, global_cond_dim)
@@ -273,6 +282,23 @@ class ConditionalUnet1D(nn.Module):
         """
         # move axis for processing
         sample = sample.moveaxis(-1, -2)
+
+        # FIXED (shape mismatch): with the default down_dims=[256,512,1024]
+        # (2 real downsample stages), a horizon of 10 goes 10->5->3 going
+        # down (5 is odd, so the second Conv1d(k=3,s=2,p=1) floor-divides and
+        # loses information) but Upsample1d's ConvTranspose1d always exactly
+        # DOUBLES going back up (3->6) -- 6 can never match the skip
+        # connection recorded at length 5, which is exactly the "Sizes of
+        # tensors must match" crash this fixes. Zero-padding the horizon up
+        # to the next multiple of self.pad_multiple here makes every
+        # downsample/upsample step exact (verified by hand for T=10 ->
+        # padded to 12: 12->6->3->6->12, all exact); the padding is cropped
+        # back off before returning, so callers still see length-10 tensors.
+        orig_T = sample.shape[-1]
+        pad_len = (-orig_T) % self.pad_multiple
+        if pad_len > 0:
+            sample = F.pad(sample, (0, pad_len))
+
         # process global conditioning
         global_cond = self.global_1d_pool(global_cond.permute(0, 2, 1)).squeeze(-1)
         global_cond = self.norm_after_pool(global_cond) # layernorm
@@ -312,6 +338,9 @@ class ConditionalUnet1D(nn.Module):
             x = upsample(x)
 
         x = self.final_conv(x)
+
+        if pad_len > 0:
+            x = x[..., :orig_T]
 
         # (B,C,T)
         x = x.moveaxis(-1, -2)
