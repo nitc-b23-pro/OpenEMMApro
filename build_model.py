@@ -39,6 +39,20 @@ FIXED (two real bugs found while explaining the training/inference flow):
    it uses peft.PeftModel.from_pretrained(...) to load your ACTUAL saved
    adapter + head weights instead of re-randomizing them.
 """
+# COMPAT SHIM (must run before anything imports `diffusers`): diffusers'
+# top-level __init__.py unconditionally imports its dynamic-pipeline-loading
+# module, which does `from huggingface_hub import cached_download` -- a
+# function huggingface_hub has deprecated/removed. We never use that dynamic-
+# pipeline feature (only DDPMScheduler / DDIMScheduler / EMAModel), so instead
+# of chasing a "compatible" diffusers/huggingface_hub/transformers version
+# triangle (risking a much bigger breaking change, like transformers 4.x->5.x),
+# just alias the missing name back in before diffusers is ever imported. The
+# import chain that triggers this is: build_model.py -> llava_pythia.py ->
+# policy_heads.models -> droid_unet_diffusion.py -> diffusers.
+import huggingface_hub
+if not hasattr(huggingface_hub, "cached_download"):
+    huggingface_hub.cached_download = huggingface_hub.hf_hub_download
+
 from llava_pythia.model.language_model.pythia.configuration_llava_pythia import LlavaPythiaConfig
 from llava_pythia.model.language_model.pythia.llava_pythia import LlavaPythiaForCausalLM
 from llava_pythia.llava_pythia_utils import find_all_linear_names
