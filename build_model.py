@@ -21,8 +21,7 @@ def build_llava_pythia(pretrained_path):
 
     model = LlavaPythiaForCausalLM.from_pretrained(
         pretrained_path,
-        config=config,
-        trust_remote_code=True,
+        config=config
     )
 
     return model
