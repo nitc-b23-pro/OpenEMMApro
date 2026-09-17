@@ -99,6 +99,44 @@ def build_openemma_tinyvla(pretrained_path, trained_checkpoint_path=None):
             pretrained_path, config=config, torch_dtype=torch.float16
         )
 
+    # FIXED (loss=nan root cause): confirmed via a [NaN DEBUG] instrumentation
+    # pass that ~108 embed_out parameters are ALREADY non-finite immediately
+    # after from_pretrained() returns -- before LoRA, before the fp32 upcast,
+    # before any forward pass -- and every single one is an nn.Conv1d bias or
+    # an nn.GroupNorm weight/bias. Not one nn.Linear (combine, cond_encoder,
+    # diffusion_step_encoder) was affected.
+    #
+    # Root cause: from_pretrained()'s low-memory loading path allocates every
+    # parameter as raw, uninitialized memory (torch.empty()) and only fills in
+    # real values for (a) keys found in the checkpoint, and (b) "missing"
+    # keys whose module type GPTNeoXPreTrainedModel._init_weights() knows how
+    # to handle -- which is only nn.Linear, nn.Embedding, and nn.LayerNorm
+    # (confirmed by reading transformers' actual source). embed_out
+    # (ConditionalUnet1D) is a brand-new module type this base class has
+    # never seen, built almost entirely out of nn.Conv1d/nn.GroupNorm --
+    # neither is in that isinstance() chain, so their tensors were simply
+    # never written to: raw uninitialized memory, which very often decodes
+    # as NaN/Inf when read as floats. This is exactly why the corruption was
+    # 100%, deterministic, and present on step 0 before any training ever
+    # happened -- it was never a computed value, just garbage bits nothing
+    # had written real numbers into.
+    #
+    # Fix: explicitly reset every Conv1d/ConvTranspose1d/GroupNorm inside the
+    # newly-built head using PyTorch's own standard reset_parameters() --
+    # the exact call every one of these layers normally runs in its own
+    # __init__, which from_pretrained's fast-init path skipped because it
+    # doesn't recognize these module types. This must happen BEFORE
+    # get_peft_model() below, so the clean values are what gets deep-copied
+    # into modules_to_save's trainable copy.
+    reinitialized = []
+    for module_name, submodule in model.embed_out.named_modules():
+        if isinstance(submodule, (torch.nn.Conv1d, torch.nn.ConvTranspose1d, torch.nn.GroupNorm)):
+            submodule.reset_parameters()
+            reinitialized.append(module_name)
+    print(f"[build_openemma_tinyvla] reset_parameters() re-ran on {len(reinitialized)} "
+          f"Conv1d/ConvTranspose1d/GroupNorm submodules inside embed_out (fixing the "
+          f"uninitialized-memory NaN bug from from_pretrained's fast-init path).")
+
     # 4. Wrap it in LoRA: freeze almost everything, add small trainable "patches"
     #    to the vision tower ('vit') and language model ('llm'). modules_to_save
     #    makes sure the brand-new diffusion head is tracked (and saved/reloaded)
