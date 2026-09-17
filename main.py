@@ -17,7 +17,7 @@ from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, 
 from PIL import Image
 
 from build_model import build_llava_pythia
-from llava_pythia_inference import llava_pythia_generate
+from llava_pythia_inference import llava_pythia_generate, preprocess_image
 from transformers import AutoTokenizer, CLIPImageProcessor
 
 OBS_LEN = 10
@@ -96,10 +96,26 @@ def GenerateMotion(image_path, obs_velocities, obs_curvatures, given_intent, pro
         Infer the association between these numbers and the image sequence, then predict what the NEXT 10 speed and curvature values will be, half a second apart. 
         Answer with exactly 10 comma-separated pairs, each written as [speed,curvature] using real numbers you infer from the image and the trend in the history above -- for example a well-formed answer looks like [7.1,0.05], [6.9,0.08], [6.8,0.10], [6.6,0.12], [6.5,0.11], [6.5,0.09], [6.6,0.07], [6.8,0.05], [7.0,0.03], [7.2,0.02] (those exact numbers are only a formatting example, not your answer). 
         Do not output the words speed_1, curvature_1, etc, do not repeat the historical values above, and do not include any other words. Future speeds and curvatures:"""
+    # BUG FIX: this retry used to accept any result containing the character
+    # "[" as a success -- which the literal echoed placeholder text
+    # ("[speed_1, curvature_1], ...") also contains, so a completely useless
+    # answer could "pass" on the very first attempt and never actually retry.
+    # It also used to live INSIDE a second, outer 3x retry in __main__ that
+    # reran SceneDescription/DescribeObjects/DescribeOrUpdateIntent from
+    # scratch every time this prompt failed to parse -- i.e. up to 3 (outer)
+    # x [3 (this loop) + 3 unrelated description calls] = up to 18 full VLM
+    # calls for one frame, even though a bad Motion answer has nothing to do
+    # with Scene/Object/Intent. Scene/Object/Intent are now generated exactly
+    # once per frame (see __main__), and this is the ONLY retry loop for the
+    # numeric prediction, using the same regex __main__ will use to parse it,
+    # so "success" here actually means "will parse".
+    coord_pattern = r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]"
+    result = ""
     for rho in range(3):
         result = vlm_inference(text=prompt, image_path=image_path, processor=processor, model=model, tokenizer=tokenizer, args=args)
         print("Result: ", result)
-        if not "unable" in result and not "sorry" in result and "[" in result:
+        pred_waypoints = result.replace("Future speeds and curvatures:", "").strip()
+        if "unable" not in result and "sorry" not in result and re.findall(coord_pattern, pred_waypoints):
             break
     return result, scene_description, object_description, intent_description
 
@@ -117,12 +133,40 @@ if __name__ == '__main__':
     model = None    #Before Loading Clean state, No leftover memory, Safe fallback if a model isn’t loaded
     processor = None
     tokenizer = None
+
+    # Free any GPU memory left resident from an earlier cell/run in this same
+    # Kaggle kernel (e.g. a previous Qwen or LLaVA-Pythia load that was never
+    # released) before asking for more. This does NOT fix an OOM caused by a
+    # genuinely different process holding the memory -- if that's the case,
+    # restart the Kaggle kernel/session before re-running this cell.
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    checkpoint_path = "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/"
     try:
-        model = build_llava_pythia("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/").cuda().eval()
-        tokenizer = AutoTokenizer.from_pretrained("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
-        processor = CLIPImageProcessor.from_pretrained("/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
+        model = build_llava_pythia(checkpoint_path).cuda().eval()
+        tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        processor = CLIPImageProcessor.from_pretrained(checkpoint_path)
     except Exception as e:
-        print("Exception:", e)
+        # NOTE: this used to just print the exception and fall through to the
+        # main scene/frame loop with model=tokenizer=processor=None. That is
+        # what turned a clear, actionable load-time error (e.g. CUDA OOM) into
+        # a confusing "'NoneType' object is not callable" crash hundreds of
+        # lines later, deep inside tokenizer_image_token(). Fail loudly here
+        # instead, right where the real problem is.
+        print("Failed to load the LLaVA-Pythia checkpoint:", e)
+        if "out of memory" in str(e).lower():
+            print(
+                "This looks like a CUDA OOM at *load* time, not something caused by "
+                "the inference code further down. Likely causes: (1) a previous cell "
+                "in this same Kaggle kernel still has a model resident on the GPU -- "
+                "restart the kernel/session and re-run from the top; (2) the GPU is "
+                "genuinely too small for this checkpoint + the CLIP vision tower + "
+                "YOLO3D all loaded at once -- build_model.py now loads in fp16 by "
+                "default, which should roughly halve the backbone's memory footprint."
+            )
+        raise SystemExit(1)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     timestamp = args.model_path + f"_results/{args.method}/" + timestamp
@@ -231,19 +275,29 @@ if __name__ == '__main__':
             img = cv2.imread(current_image)
             img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
 
-            for _ in range(3):
-                (prediction,
-                scene_description,
-                object_description,
-                updated_intent) = GenerateMotion(current_image, obs_ego_velocities,
-                                                obs_ego_curvatures, prev_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
+            # Encode this frame's image ONCE and reuse the tensor for every VLM
+            # call made about it below (Scene/Object/Intent/Motion, x up to 3
+            # retries) instead of re-opening + re-preprocessing the same JPEG
+            # from disk on each of those up to ~12 calls.
+            current_image_input = (
+                preprocess_image(current_image, processor, model)
+                if model is not None else current_image
+            )
 
-                # Process the output.
-                prev_intent = updated_intent  # Stateful intent
-                pred_waypoints = prediction.replace("Future speeds and curvatures:", "").strip()
-                coordinates = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", pred_waypoints)
-                if not coordinates == []:
-                    break
+            # GenerateMotion() now retries the numeric prompt internally (with a
+            # real parse check, see the fix there) without re-running Scene/
+            # Object/Intent -- so this is a single call, not a second outer
+            # retry loop that used to redo the whole 4-prompt chain 3x.
+            (prediction,
+            scene_description,
+            object_description,
+            updated_intent) = GenerateMotion(current_image_input, obs_ego_velocities,
+                                            obs_ego_curvatures, prev_intent, processor=processor, model=model, tokenizer=tokenizer, args=args)
+
+            # Process the output.
+            prev_intent = updated_intent  # Stateful intent
+            pred_waypoints = prediction.replace("Future speeds and curvatures:", "").strip()
+            coordinates = re.findall(r"\[([-+]?\d*\.?\d+),\s*([-+]?\d*\.?\d+)\]", pred_waypoints)
             if coordinates == []:
                 continue
             speed_curvature_pred = [[float(v), float(k)] for v, k in coordinates]
