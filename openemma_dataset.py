@@ -1,26 +1,42 @@
 """
 openemma_dataset.py
 Turns your nuScenes scenes into a PyTorch Dataset of
-(image, intent_text, history[10,2], future[10,2]) samples.
+(image_path, prompt_text, history[10,2], future[10,2]) samples.
+
+CHANGED (prompt redesign): no more `intents_cache.json` / precomputed
+intent text. There is no separate intent field any more -- the model
+gets the image plus the raw motion-history numbers and must infer scene
+understanding, object behavior, and intent itself (see prompts.py). The
+`if key not in self.intents: continue` filter is gone too, since there
+is no cache to be missing from -- every window with enough frames is now
+used.
+
+CHANGED (dataset split): `version` is no longer defaulted silently for
+training -- train_openemma_tinyvla.py now passes version="v1.0-test"
+explicitly. v1.0-test has no sample_annotation (object-box labels are
+withheld for the leaderboard), but it DOES have ego_pose / sample_data /
+calibrated_sensor, and this dataset's ground truth (`fut`, the future
+speed/curvature) comes only from ego_pose -- never from
+sample_annotation -- so v1.0-test is usable here even though it would
+NOT be usable for anything that needs labeled object boxes.
 """
-import os, json
+import os
 from math import atan2
 import numpy as np
 import torch
 from nuscenes import NuScenes
 from utils import EstimateCurvatureFromTrajectory   # your existing file, unchanged
+from prompts import build_prompt, OBS_LEN as _OBS_LEN, FUT_LEN as _FUT_LEN
 
-OBS_LEN, FUT_LEN = 10, 10
+OBS_LEN, FUT_LEN = _OBS_LEN, _FUT_LEN
 TTL_LEN = OBS_LEN + FUT_LEN
 
-class OpenEMMADataset(torch.utils.data.Dataset):
-    def __init__(self, dataroot="datasets/NuScenes", version="v1.0-mini",
-                 intents_cache_path="intents_cache.json"):
-        self.nusc = NuScenes(version=version, dataroot=dataroot)
-        with open(intents_cache_path) as f:
-            self.intents = json.load(f)   # built by precompute_intents.py
 
-        self.samples = []   # each entry: dict(image=..., key=..., obs=..., fut=...)
+class OpenEMMADataset(torch.utils.data.Dataset):
+    def __init__(self, dataroot="datasets/NuScenes", version="v1.0-test"):
+        self.nusc = NuScenes(version=version, dataroot=dataroot)
+
+        self.samples = []   # each entry: dict(image_path=..., obs=..., fut=...)
         for scene in self.nusc.scene:
             name = scene["name"]
             tok = scene["first_sample_token"]
@@ -46,15 +62,11 @@ class OpenEMMADataset(torch.utils.data.Dataset):
             speed = np.linalg.norm(vel, axis=1)
 
             for i in range(len(images) - TTL_LEN):
-                key = f"{name}_{i}"
-                if key not in self.intents:
-                    continue   # skip frames we didn't precompute an intent for
                 obs = np.stack([speed[i:i+OBS_LEN], curv[i:i+OBS_LEN] * 100], axis=1)   # (10,2)
                 fut = np.stack([speed[i+OBS_LEN:i+TTL_LEN],
                                  curv[i+OBS_LEN:i+TTL_LEN] * 100], axis=1)               # (10,2)
                 self.samples.append(dict(
                     image_path=images[i + OBS_LEN - 1],
-                    intent=self.intents[key],
                     obs=obs.astype(np.float32),
                     fut=fut.astype(np.float32),
                 ))
@@ -66,8 +78,8 @@ class OpenEMMADataset(torch.utils.data.Dataset):
         s = self.samples[idx]
         return dict(
             image_path=s["image_path"],
-            raw_lang=f"Given the driving intent: {s['intent']}. Predict the future speeds and curvatures.",
-            state=torch.from_numpy(s["obs"].flatten()),      # (20,) -- the "history" numbers
-            action=torch.from_numpy(s["fut"]),                # (10,2) -- the correct-answer numbers
+            raw_lang=build_prompt(s["obs"]),                 # SAME prompt fn used at inference time
+            state=torch.from_numpy(s["obs"].flatten()),       # (20,) -- the "history" numbers
+            action=torch.from_numpy(s["fut"]),                 # (10,2) -- the correct-answer numbers (diffusion target)
             is_pad=torch.zeros(10, dtype=torch.bool),
         )
