@@ -199,4 +199,29 @@ def build_openemma_tinyvla(pretrained_path, trained_checkpoint_path=None):
         # instead of re-randomizing them.
         model = PeftModel.from_pretrained(model, trained_checkpoint_path, is_trainable=False)
 
+        # FIXED (inference dtype mismatch): the base model above is loaded with
+        # torch_dtype=torch.float16, so PeftModel.from_pretrained() allocates the
+        # LoRA / embed_out / proj_to_action destination tensors as fp16 BEFORE it
+        # copies the checkpoint's saved values into them. Since training upcast
+        # these same parameters to fp32 (see the `if trained_checkpoint_path is
+        # None:` branch above), the saved checkpoint values are fp32 -- but the
+        # in-place copy into fp16-allocated destination tensors silently downcasts
+        # them back to fp16. is_trainable=False also sets requires_grad=False on
+        # every parameter here, so (unlike the fresh-training branch) we can't
+        # filter by requires_grad -- we match by parameter name instead. Without
+        # this, forward_diffusion_head()'s unconditional `hidden_states.float()`
+        # produces an fp32 input that hits norm_after_pool's still-fp16
+        # LayerNorm weight/bias, crashing with "expected scalar type Float but
+        # found Half" during inference (mirror image of the training-side dtype
+        # bugs fixed earlier).
+        upcasted = []
+        for name, param in model.named_parameters():
+            if "lora_" in name or "embed_out" in name or "proj_to_action" in name:
+                param.data = param.data.float()
+                upcasted.append(name)
+        print(f"[build_openemma_tinyvla] upcast {len(upcasted)} lora_/embed_out/"
+              f"proj_to_action parameter(s) back to fp32 after loading the trained "
+              f"checkpoint (fixing the inference-time fp16/fp32 LayerNorm dtype "
+              f"mismatch).")
+
     return model

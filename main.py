@@ -90,7 +90,7 @@ if __name__ == '__main__':
     BASE_PRETRAINED = "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/"
     # TRAINED_CHECKPOINT: one of the openemma_tinyvla_epochN directories
     # written by train_openemma_tinyvla.py's model.save_pretrained(...).
-    TRAINED_CHECKPOINT = "/kaggle/working/OpenEMMApro/openemma_tinyvla_epoch0/"
+    TRAINED_CHECKPOINT = "/kaggle/working/OpenEMMApro/openemma_tinyvla_epoch4/"
 
     model = build_openemma_tinyvla(BASE_PRETRAINED, trained_checkpoint_path=TRAINED_CHECKPOINT).cuda().eval()
     tokenizer = AutoTokenizer.from_pretrained(BASE_PRETRAINED)
