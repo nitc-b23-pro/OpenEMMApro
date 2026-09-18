@@ -71,7 +71,7 @@ def build_prompt(obs):
         f"judgement of the road ahead -- nearby vehicles, pedestrians, lane geometry, and "
         f"where the vehicle is headed -- decide how it should move for the next {FUT_LEN} "
         "timesteps (0.5s apart). Use the recent motion history below only as a hint of its "
-        "current trajectory, not as something to copy forward.\n\n"
+        "current trajectory\n\n"
         f"Recent motion history, oldest to most recent ([speed m/s, curvature x100]):\n{history}\n\n"
         f"Output the vehicle's predicted speed and curvature for each of the next {FUT_LEN} "
         "timesteps."
