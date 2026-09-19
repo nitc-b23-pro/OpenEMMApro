@@ -82,10 +82,10 @@ loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" not in n and "proj_to_action" not in n]
 head_params = [p for n, p in model.named_parameters() if p.requires_grad and ("embed_out" in n or "proj_to_action" in n)]
 optimizer = torch.optim.AdamW([
-    # {"params": lora_params, "lr": 2e-4},
-    # {"params": head_params, "lr": 2e-5},
-    {"params": lora_params, "lr": 1e-5},
-    {"params": head_params, "lr": 2e-4},
+    {"params": lora_params, "lr": 2e-4},
+    {"params": head_params, "lr": 2e-5},
+    # {"params": lora_params, "lr": 1e-5},
+    # {"params": head_params, "lr": 2e-4},
 ])
 
 def preprocess_batch(batch):
@@ -108,7 +108,7 @@ def preprocess_batch(batch):
     # fp16 here makes that round-trip land on fp16, matching mm_projector.
     return padded.cuda(), torch.stack(images_list).cuda().half()
 
-EPOCHS = 5
+EPOCHS = 20
 
 # --- global frame counter + running average frame-processing time ---
 global_frame_count = 0
