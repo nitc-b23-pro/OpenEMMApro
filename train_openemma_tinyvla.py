@@ -28,6 +28,7 @@ should fit.
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import json
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -116,8 +117,17 @@ total_process_time = 0.0
 
 optimizer.zero_grad()
 
+filename = "lp_epoch_loss.json"
+
+# Create the file with an empty dictionary if it doesn't exist yet
+losses = {}
+if not os.path.exists(filename):
+  with open(filename, "w") as file:
+    json.dump(losses, file)
+
 for epoch in range(EPOCHS):
     print(f"Epoch {epoch} running...!")
+    s_loss, s_t = 0, 0
     for step, batch in enumerate(loader):
         frame_start = time.time()
 
@@ -194,13 +204,49 @@ for epoch in range(EPOCHS):
         total_process_time += step_time
         per_frame_time = step_time / batch_size
         running_avg_frame_time = total_process_time / global_frame_count
+        
+        s_loss += loss.item()
+        s_t += 1
 
         if step % 20 == 0:
             print(f"epoch {epoch} step {step} | global_frame_count={global_frame_count} | "
                   f"loss={loss.item():.4f} | per_frame_time={per_frame_time:.3f}s | "
                   f"running_avg_frame_time={running_avg_frame_time:.3f}s")
+            
+    with open(filename, "r") as file:
+        losses = json.load(file)
+
+    # Update the dictionary
+    losses[f"epoch-{epoch}"] = s_loss/s_t
+
+    # Write back the fresh dictionary
+    with open(filename, "w") as file:
+        json.dump(losses, file, indent=4)
 
     model.save_pretrained(f"openemma_tinyvla_epoch{epoch}")
 
 print(f"Training done. Total frames processed: {global_frame_count}, "
       f"final running average frame-processing time: {total_process_time / max(global_frame_count, 1):.3f}s")
+
+import matplotlib.pyplot as plt
+
+with open(filename, "r") as file:
+    losses = json.load(file)
+
+plt.figure(figsize=(12, 6))
+plt.plot(
+    list(losses.keys()), list(losses.values()), marker="o", linestyle="-"
+)
+
+# Add labels and title for readability
+plt.xlabel("Epoch")
+plt.ylabel("Loss Value")
+plt.title("Training Loss per Epoch")
+plt.xticks(rotation=45)  # Rotate epoch labels if they crowd together
+plt.grid(True)
+
+# 1. SAVE FIRST (with dpi=300 for high resolution)
+plt.savefig("ep_loss_graph.jpg", dpi=300, bbox_inches="tight")
+
+# 2. SHOW LAST
+plt.show()
