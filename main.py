@@ -76,6 +76,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="lp")
     parser.add_argument("--plot", type=bool, default=True)
+    parser.add_argument("--epoch", type=str, default="0")
     parser.add_argument("--dataroot", type=str, default='datasets/NuScenes')
     parser.add_argument("--version", type=str, default='v1.0-mini')   # <-- inference split (per project requirement)
     parser.add_argument("--method", type=str, default='openemma')
@@ -90,7 +91,7 @@ if __name__ == '__main__':
     BASE_PRETRAINED = "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/"
     # TRAINED_CHECKPOINT: one of the openemma_tinyvla_epochN directories
     # written by train_openemma_tinyvla.py's model.save_pretrained(...).
-    TRAINED_CHECKPOINT = "/kaggle/working/OpenEMMApro/openemma_tinyvla_epoch4/"
+    TRAINED_CHECKPOINT = f"/kaggle/working/OpenEMMApro/openemma_tinyvla_epoch{args.epoch}/"
 
     model = build_openemma_tinyvla(BASE_PRETRAINED, trained_checkpoint_path=TRAINED_CHECKPOINT).cuda().eval()
     tokenizer = AutoTokenizer.from_pretrained(BASE_PRETRAINED)
