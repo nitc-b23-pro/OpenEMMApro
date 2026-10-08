@@ -19,7 +19,39 @@ calibrated_sensor, and this dataset's ground truth (`fut`, the future
 speed/curvature) comes only from ego_pose -- never from
 sample_annotation -- so v1.0-test is usable here even though it would
 NOT be usable for anything that needs labeled object boxes.
+
+ADDED (scene id + sample id, for validation split + intent lookup):
+every sample dict now also carries `scene` (the nuScenes scene name) and
+`sample_id` (f"{scene}__{i}", stable and unique across the whole
+dataset). Neither changes what __getitem__ returns to the training loop
+by default -- they exist so train_openemma_tinyvla.py can split by
+WHOLE SCENE (not by individual frame) when carving out a validation set,
+and so a precomputed intents-by-sample-id JSON (see generate_intents.py)
+can be looked up per sample. Splitting by scene matters here because
+consecutive frames in the same scene come from heavily overlapping
+10-past/10-future windows -- a frame-level random split would leak
+nearly-identical windows across train/val.
+
+ADDED (intent, re-added -- see prompts.py's docstring for why this is
+safe to do again): `intents_path`, optional. When given and the file
+exists, it's loaded as a {sample_id: intent_string} JSON map (produced
+by generate_intents.py) and each sample's intent is looked up and
+threaded into build_prompt(). A sample with no entry in the map (or no
+map at all) gets intent=None, which build_prompt() treats exactly like
+before this change -- so this is backward compatible with every existing
+caller that doesn't pass intents_path. (generate_intents.py's intents
+are now a deterministic, map-free "turn-by-turn navigator" phrase --
+see route_intent.py -- not a VLM-generated scene description, so there
+is no image-model dependency anywhere in this file or its intent path.)
+
+ADDED (iter_scene_motion, extracted): the scene-walking + curvature/speed
+computation that used to live only inside __init__'s loop is now its own
+generator function, reused by generate_intents.py so that script doesn't
+re-implement (and risk drifting from) this exact logic. __init__'s own
+behavior/output is unchanged by this refactor -- it's the same
+computation, just factored out.
 """
+import json
 import os
 from math import atan2
 import numpy as np
@@ -31,36 +63,52 @@ from prompts import build_prompt, OBS_LEN as _OBS_LEN, FUT_LEN as _FUT_LEN
 OBS_LEN, FUT_LEN = _OBS_LEN, _FUT_LEN
 TTL_LEN = OBS_LEN + FUT_LEN
 
+DT = 0.5   # nuScenes keyframes are 2 Hz
+
+
+def iter_scene_motion(nusc):
+    """
+    Walks every scene in `nusc` once, yielding
+    (scene_name, image_paths, speed, curv, world) for every scene with at
+    least TTL_LEN frames. speed/curv/world are FULL per-scene arrays (one
+    entry per keyframe), not cropped to OBS_LEN/FUT_LEN -- a caller that
+    needs more look-ahead than a single obs/fut window (e.g.
+    generate_intents.py, which looks past the prediction window for a
+    navigator-style intent) can slice these directly instead of
+    recomputing curvature/speed itself.
+    """
+    for scene in nusc.scene:
+        name = scene["name"]
+        tok = scene["first_sample_token"]
+        images, poses = [], []
+        while True:
+            sample = nusc.get("sample", tok)
+            cam = nusc.get("sample_data", sample["data"]["CAM_FRONT"])
+            images.append(os.path.join(nusc.dataroot, cam["filename"]))
+            poses.append(nusc.get("ego_pose", cam["ego_pose_token"]))
+            if tok == scene["last_sample_token"]:
+                break
+            tok = sample["next"]
+
+        if len(images) < TTL_LEN:
+            continue
+
+        world = np.array([p["translation"][:3] for p in poses])
+        vel = np.zeros_like(world)
+        vel[1:] = (world[1:] - world[:-1]) / DT
+        vel[0] = vel[1]
+        curv = EstimateCurvatureFromTrajectory(world)
+        speed = np.linalg.norm(vel, axis=1)
+
+        yield name, images, speed, curv, world
+
 
 class OpenEMMADataset(torch.utils.data.Dataset):
-    def __init__(self, dataroot="datasets/NuScenes", version="v1.0-test"):
+    def __init__(self, dataroot="datasets/NuScenes", version="v1.0-test", intents_path=None):
         self.nusc = NuScenes(version=version, dataroot=dataroot)
 
-        self.samples = []   # each entry: dict(image_path=..., obs=..., fut=...)
-        for scene in self.nusc.scene:
-            name = scene["name"]
-            tok = scene["first_sample_token"]
-            images, poses = [], []
-            while True:
-                sample = self.nusc.get("sample", tok)
-                cam = self.nusc.get("sample_data", sample["data"]["CAM_FRONT"])
-                images.append(os.path.join(self.nusc.dataroot, cam["filename"]))
-                poses.append(self.nusc.get("ego_pose", cam["ego_pose_token"]))
-                if tok == scene["last_sample_token"]:
-                    break
-                tok = sample["next"]
-
-            if len(images) < TTL_LEN:
-                continue
-
-            DT = 0.5
-            world = np.array([p["translation"][:3] for p in poses])
-            vel = np.zeros_like(world)
-            vel[1:] = (world[1:] - world[:-1]) / DT
-            vel[0] = vel[1]
-            curv = EstimateCurvatureFromTrajectory(world)
-            speed = np.linalg.norm(vel, axis=1)
-
+        self.samples = []   # each entry: dict(image_path=..., obs=..., fut=..., scene=..., sample_id=...)
+        for name, images, speed, curv, world in iter_scene_motion(self.nusc):
             for i in range(len(images) - TTL_LEN):
                 obs = np.stack([speed[i:i+OBS_LEN], curv[i:i+OBS_LEN] * 100], axis=1)   # (10,2)
                 fut = np.stack([speed[i+OBS_LEN:i+TTL_LEN],
@@ -69,17 +117,33 @@ class OpenEMMADataset(torch.utils.data.Dataset):
                     image_path=images[i + OBS_LEN - 1],
                     obs=obs.astype(np.float32),
                     fut=fut.astype(np.float32),
+                    scene=name,
+                    sample_id=f"{name}__{i}",
                 ))
+
+        # ADDED: optional {sample_id: intent_string} lookup, produced offline
+        # by generate_intents.py. Silently absent (self.intents = {}) if no
+        # path is given or the file doesn't exist yet -- every __getitem__
+        # lookup then just falls back to intent=None, identical to before
+        # this feature existed.
+        self.intents = {}
+        if intents_path and os.path.exists(intents_path):
+            with open(intents_path, "r") as f:
+                self.intents = json.load(f)
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         s = self.samples[idx]
+        intent = self.intents.get(s["sample_id"])   # None if no map, or no entry for this sample
         return dict(
             image_path=s["image_path"],
-            raw_lang=build_prompt(s["obs"]),                 # SAME prompt fn used at inference time
+            raw_lang=build_prompt(s["obs"], intent=intent),   # SAME prompt fn used at inference time
             state=torch.from_numpy(s["obs"].flatten()),       # (20,) -- the "history" numbers
             action=torch.from_numpy(s["fut"]),                 # (10,2) -- the correct-answer numbers (diffusion target)
             is_pad=torch.zeros(10, dtype=torch.bool),
+            scene=s["scene"],
+            sample_id=s["sample_id"],
+            intent=intent if intent is not None else "",
         )
