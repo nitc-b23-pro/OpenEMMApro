@@ -38,10 +38,7 @@ eval mode and run (no_grad, no backward, no optimizer step) over the
 validation set once, using the exact same forward call and loss as
 training. The resulting per-epoch average is written to
 val_epoch_losses.json, mirroring the existing lp_epoch_loss.json format
-exactly (same {"epoch-N": avg_loss} shape), so the two can be plotted
-against each other directly (see the matplotlib block at the bottom of
-this file, or the standalone plot_losses.py if you want to regenerate the
-graph later without re-running training).
+exactly (same {"epoch-N": avg_loss} shape).
 
 FIXED (NaN/Inf loss was silently poisoning the WHOLE epoch's average):
 previously, when a step's loss was non-finite, the code printed a warning
@@ -53,20 +50,56 @@ a single bad batch anywhere in an epoch would silently turn that whole
 epoch's saved average into NaN. This is now handled the same way the OOM
 branch already was: `continue` immediately after the warning, so a
 non-finite step is excluded from the epoch average instead of poisoning
-it. (The same fix is applied to the new validation loop below.)
+it. (The same fix is applied to the validation loop below.)
 
 ADDED (--use-intent / --no-intent CLI flag, default ON): whether each
 sample's prompt includes a route-navigation intent line (see
 route_intent.py / generate_intents.py / prompts.py) is now a command-line
 choice instead of an always-on constant. Default is --use-intent (True),
 which is "like previous" in the sense that this is the behavior that was
-already shipped: INTENTS_PATH is looked up and threaded into every
-prompt if generate_intents.py has produced it. Pass --no-intent to train
-with the exact prompt behavior from before the intent feature existed at
-all (no intent line, ever, regardless of whether the intents JSON
-exists). This matters for a clean comparison: a checkpoint trained with
---no-intent should be evaluated with main.py's/eval_train_vs_test.py's
---no-intent too, or the prompt distribution at eval won't match training.
+already shipped. Pass --no-intent to train with the exact prompt behavior
+from before the intent feature existed at all. This matters for a clean
+comparison: a checkpoint trained with --no-intent should be evaluated
+with main.py's/eval_train_vs_test.py's --no-intent too.
+
+ADDED (--balance-classes / --no-balance-classes CLI flag, default ON):
+diagnosed from the epoch-19 inference results -- ADE was near-perfect on
+some scenes (sub-meter) and catastrophic on others (10-20+ m by 3s), and
+eval_train_vs_test.py showed this split along MANEUVER lines, not
+train/test lines: several scenes the model trained on directly were just
+as bad as the worst unseen scenes. generate_intents.py's own printed
+distribution showed why -- "continue straight" is ~75% of every training
+window regardless of which scene it's in, so uniform random sampling lets
+the majority class dominate every batch's gradient no matter how the
+scene-level split is drawn. --balance-classes computes each TRAINING
+sample's own maneuver class (openemma_dataset.py's `fut_class` -- the
+coarse label of the ACTUAL FUT window, used only as a resampling key,
+never fed to the model) and uses a WeightedRandomSampler with
+inverse-class-frequency weights so turns/bears/u-turns are seen roughly
+as often as straight-driving windows over the course of an epoch. Pass
+--no-balance-classes to go back to plain uniform random sampling.
+
+ADDED (--ade-eval-every / --ade-eval-samples, real ADE tracking during
+training): the diffusion loss plotted at the end of a run lives in a
+different, non-metric feature space from ADE (trajectory displacement
+error in meters) -- IntegrateCurvatureForPoints is a nonlinear,
+error-compounding transform between the two, so a falling loss does not
+guarantee a falling ADE (this is exactly what the epoch-19 results
+showed: loss plateaued around 0.40-0.45, but ADE was several meters to
+tens of meters on a third of the evaluated scenes). Every
+--ade-eval-every epochs (default 5, plus always on the final epoch),
+run_validation_ade() runs the model's ACTUAL diffusion sampling loop
+(eval=True, the same path main.py uses for inference, not the training
+loss) on an evenly-spaced subset of --ade-eval-samples validation
+examples (default 64), reconstructs each predicted trajectory with
+utils.IntegrateCurvatureForPoints (identical math to main.py), and
+compares it against openemma_dataset.py's cur_pos/cur_vel/fut_world
+fields to get a real ADE in meters -- written to val_ade_epochs.json and
+plotted (val_ade_graph.jpg) alongside the loss curves at the end of the
+run. This is deliberately bounded (a subset, not the whole validation
+set, and not every epoch) because the eval=True sampling path runs an
+iterative denoising loop per example and is far slower than a single
+training forward pass.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -75,26 +108,41 @@ import argparse
 import json
 import random
 import time
+from collections import Counter
+from math import atan2
+
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 from PIL import Image
 import numpy as np
 
 from build_model import build_openemma_tinyvla
 from openemma_dataset import OpenEMMADataset
+from utils import IntegrateCurvatureForPoints
 from llava_pythia.mm_utils import tokenizer_image_token
 from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from transformers import AutoTokenizer, CLIPImageProcessor
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--use-intent", dest="use_intent", action="store_true", default=True,
                          help="Thread a route-navigation intent (route_intent.py / generate_intents.py) "
                               "into each sample's prompt, same as prompts.py's intent= argument (default: on).")
     parser.add_argument("--no-intent", dest="use_intent", action="store_false",
                          help="Disable intent in the prompt -- reverts to the exact prompt text from "
                               "before the intent feature existed, regardless of whether an intents JSON is present.")
+    parser.add_argument("--balance-classes", dest="balance_classes", action="store_true", default=True,
+                         help="Oversample rare maneuver classes (turns/bears/u-turns) relative to the dominant "
+                              "'continue straight' majority via a WeightedRandomSampler (default: on).")
+    parser.add_argument("--no-balance-classes", dest="balance_classes", action="store_false",
+                         help="Disable class balancing -- plain uniform random sampling, like before this feature existed.")
+    parser.add_argument("--ade-eval-every", type=int, default=5,
+                         help="Run a REAL validation ADE check (meters, via the diffusion sampling loop + "
+                              "trajectory reconstruction) every N epochs, plus always on the final epoch (default: 5).")
+    parser.add_argument("--ade-eval-samples", type=int, default=64,
+                         help="How many validation samples (evenly spaced across the val set) the ADE check "
+                              "uses each time it runs (default: 64).")
     return parser.parse_args()
 
 
@@ -178,8 +226,40 @@ val_dataset = Subset(dataset, val_indices)
 # memory of any single forward/backward drops.
 BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 2
-loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+# ADDED (--balance-classes): see this file's module docstring for the full
+# rationale. `fut_class` is computed once per sample inside
+# OpenEMMADataset.__init__ (openemma_dataset.py) from that sample's OWN
+# future window -- it is a resampling key only, never a model input.
+train_classes = [dataset.samples[i]["fut_class"] for i in train_indices]
+class_counts = Counter(train_classes)
+print(f"Train-set maneuver class distribution (before any balancing): {dict(class_counts)}")
+
+if args.balance_classes:
+    # Inverse-frequency weight per class, rescaled so the mean weight is 1
+    # (cosmetic -- WeightedRandomSampler only cares about RELATIVE weights,
+    # this just keeps the printed numbers readable).
+    class_weight = {c: 1.0 / n for c, n in class_counts.items()}
+    mean_w = float(np.mean(list(class_weight.values())))
+    class_weight = {c: w / mean_w for c, w in class_weight.items()}
+    print(f"Class weights (--balance-classes, inverse-frequency): {class_weight}")
+
+    sample_weights = [class_weight[c] for c in train_classes]
+    # num_samples=len(train_indices): each epoch still draws the SAME NUMBER
+    # of examples as before -- it's the MIX that changes (rare maneuvers
+    # repeated more often, the straight-driving majority seen relatively
+    # less often per epoch, in expectation), which is the standard, expected
+    # behavior of a weighted sampler with replacement, not a bug.
+    train_sampler = WeightedRandomSampler(
+        sample_weights, num_samples=len(train_indices), replacement=True,
+        generator=torch.Generator().manual_seed(SPLIT_SEED),
+    )
+    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler)
+else:
+    print("Class balancing DISABLED (--no-balance-classes): uniform random sampling, like before this feature existed.")
+    loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)   # val is NEVER resampled -- it should stay representative
 
 # Two learning rates, exactly like TinyVLA's original recipe:
 #   - a small one for the LoRA "patches" on the pretrained VLM (don't want to move it far)
@@ -214,6 +294,9 @@ def preprocess_batch(batch):
     return padded.cuda(), torch.stack(images_list).cuda().half()
 
 EPOCHS = 20
+DT_ADE = 0.5   # nuScenes keyframes are 2 Hz -- matches DT in openemma_dataset.py / main.py
+ADE_EVAL_EVERY = args.ade_eval_every
+ADE_EVAL_SAMPLES = args.ade_eval_samples
 
 # --- global frame counter + running average frame-processing time ---
 global_frame_count = 0
@@ -222,7 +305,8 @@ total_process_time = 0.0
 optimizer.zero_grad()
 
 filename = "lp_epoch_loss.json"
-val_filename = "val_epoch_losses.json"   # ADDED
+val_filename = "val_epoch_losses.json"
+val_ade_filename = "val_ade_epochs.json"   # ADDED
 
 # Create the files with an empty dictionary if they don't exist yet
 losses = {}
@@ -230,20 +314,27 @@ if not os.path.exists(filename):
   with open(filename, "w") as file:
     json.dump(losses, file)
 
-val_losses = {}   # ADDED
-if not os.path.exists(val_filename):   # ADDED
-  with open(val_filename, "w") as file:   # ADDED
-    json.dump(val_losses, file)   # ADDED
+val_losses = {}
+if not os.path.exists(val_filename):
+  with open(val_filename, "w") as file:
+    json.dump(val_losses, file)
+
+val_ade = {}   # ADDED
+if not os.path.exists(val_ade_filename):   # ADDED
+  with open(val_ade_filename, "w") as file:   # ADDED
+    json.dump(val_ade, file)   # ADDED
 
 
 def run_validation(epoch):
     """
-    ADDED. One no-grad pass over val_loader, using the exact same forward
-    call and loss as training (just no backward()/optimizer.step()), and
-    the same finite-loss guard as the training loop below. Returns the
-    average loss over the epoch, or None if every single validation step
-    was skipped (OOM / non-finite) -- which would mean something is
-    actually wrong, not just "no validation data."
+    One no-grad pass over val_loader, using the exact same forward call and
+    loss as training (just no backward()/optimizer.step()), and the same
+    finite-loss guard as the training loop below. Returns the average loss
+    over the epoch, or None if every single validation step was skipped
+    (OOM / non-finite) -- which would mean something is actually wrong, not
+    just "no validation data." This is the DIFFUSION LOSS, in its own
+    normalized feature space -- see run_validation_ade() below for the real,
+    meters-space metric.
     """
     model.eval()
     v_loss, v_t = 0.0, 0
@@ -273,6 +364,72 @@ def run_validation(epoch):
 
     model.train()
     return (v_loss / v_t) if v_t > 0 else None
+
+
+def run_validation_ade(epoch, max_samples=None):
+    """
+    ADDED. Runs the model's ACTUAL diffusion sampling loop (eval=True, the
+    same code path main.py's predict_step uses for real inference -- NOT
+    the training loss) on an evenly-spaced subset of up to `max_samples`
+    validation examples, reconstructs each predicted trajectory with
+    utils.IntegrateCurvatureForPoints (identical math to main.py), and
+    compares it against openemma_dataset.py's cur_pos/cur_vel/fut_world
+    fields to get a REAL ADE in meters. See this file's module docstring
+    for why this exists as a separate check from run_validation()'s loss.
+
+    Deliberately processes one sample at a time (batch size 1), matching
+    main.py's own proven-working eval=True call pattern exactly, rather
+    than risking an untested batched eval=True path.
+    """
+    model.eval()
+    max_samples = max_samples if max_samples is not None else ADE_EVAL_SAMPLES
+    n = min(max_samples, len(val_dataset))
+    if n == 0:
+        model.train()
+        return None
+    # Evenly-spaced subset (not just the first N) so this isn't silently
+    # dominated by whichever scene happens to sort first in the dataset.
+    idxs = np.linspace(0, len(val_dataset) - 1, num=n, dtype=int)
+
+    ade1s_list, ade2s_list, ade3s_list = [], [], []
+    with torch.no_grad():
+        for idx in idxs:
+            s = val_dataset[int(idx)]
+            try:
+                input_ids, images = preprocess_batch({"image_path": [s["image_path"]], "raw_lang": [s["raw_lang"]]})
+                state = s["state"].unsqueeze(0).cuda()
+                pred = model(input_ids=input_ids, images=images, states=state, eval=True)
+            except torch.OutOfMemoryError as e:
+                print(f"[val-ade] epoch {epoch} | OOM, SKIPPING one sample: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
+
+            pred = pred[0].cpu().numpy()   # (10, 2) -- [speed, curvature*100], same layout as training targets
+            pred_speeds = pred[:, 0]
+            pred_curvatures = pred[:, 1] / 100
+            cur_pos = s["cur_pos"].numpy()
+            cur_vel = s["cur_vel"].numpy()
+            fut_world = s["fut_world"].numpy()
+            initial_heading = atan2(cur_vel[1], cur_vel[0])
+            pred_traj = IntegrateCurvatureForPoints(pred_curvatures, pred_speeds, cur_pos, initial_heading, DT_ADE)
+
+            err = np.linalg.norm(fut_world - pred_traj, axis=1)   # (10,) per-step displacement error, meters
+            ade1s_list.append(float(np.mean(err[:2])))
+            ade2s_list.append(float(np.mean(err[:4])))
+            ade3s_list.append(float(np.mean(err[:6])))
+
+    model.train()
+    if not ade1s_list:
+        return None
+    mean_ade1s, mean_ade2s, mean_ade3s = float(np.mean(ade1s_list)), float(np.mean(ade2s_list)), float(np.mean(ade3s_list))
+    return {
+        "ade1s": mean_ade1s,
+        "ade2s": mean_ade2s,
+        "ade3s": mean_ade3s,
+        "avgade": float(np.mean([mean_ade1s, mean_ade2s, mean_ade3s])),   # same convention as main.py's per-scene avgade
+        "n_samples": len(ade1s_list),
+    }
 
 
 for epoch in range(EPOCHS):
@@ -379,7 +536,7 @@ for epoch in range(EPOCHS):
     with open(filename, "w") as file:
         json.dump(losses, file, indent=4)
 
-    # ADDED: one held-out validation pass per epoch, saved the same way.
+    # One held-out validation LOSS pass per epoch, saved the same way.
     val_avg = run_validation(epoch)
     print(f"epoch {epoch} | validation loss = {val_avg}")
     with open(val_filename, "r") as file:
@@ -387,6 +544,19 @@ for epoch in range(EPOCHS):
     val_losses[f"epoch-{epoch}"] = val_avg
     with open(val_filename, "w") as file:
         json.dump(val_losses, file, indent=4)
+
+    # ADDED: real ADE (meters) on a bounded validation subset, every
+    # ADE_EVAL_EVERY epochs (plus always on the final epoch) -- see
+    # run_validation_ade's and this file's module docstrings for why this
+    # is tracked separately from the diffusion loss above.
+    if (epoch % ADE_EVAL_EVERY == 0) or (epoch == EPOCHS - 1):
+        ade_summary = run_validation_ade(epoch)
+        print(f"epoch {epoch} | validation ADE (meters) = {ade_summary}")
+        with open(val_ade_filename, "r") as file:
+            val_ade = json.load(file)
+        val_ade[f"epoch-{epoch}"] = ade_summary
+        with open(val_ade_filename, "w") as file:
+            json.dump(val_ade, file, indent=4)
 
     model.save_pretrained(f"openemma_tinyvla_epoch{epoch}")
 
@@ -397,14 +567,16 @@ import matplotlib.pyplot as plt
 
 with open(filename, "r") as file:
     losses = json.load(file)
-with open(val_filename, "r") as file:   # ADDED
-    val_losses = json.load(file)   # ADDED
+with open(val_filename, "r") as file:
+    val_losses = json.load(file)
+with open(val_ade_filename, "r") as file:   # ADDED
+    val_ade = json.load(file)   # ADDED
 
 plt.figure(figsize=(12, 6))
 plt.plot(
     list(losses.keys()), list(losses.values()), marker="o", linestyle="-", label="train"
 )
-# ADDED: overlay validation loss on the same axes, same x labels, so the two
+# Overlay validation loss on the same axes, same x labels, so the two
 # curves are directly comparable at a glance.
 plt.plot(
     list(val_losses.keys()), list(val_losses.values()), marker="s", linestyle="--", label="val"
@@ -423,3 +595,25 @@ plt.savefig("ep_loss_graph.jpg", dpi=300, bbox_inches="tight")
 
 # 2. SHOW LAST
 plt.show()
+
+# ADDED: real validation ADE per epoch -- the metric that actually matters,
+# plotted separately since it's only recorded every ADE_EVAL_EVERY epochs
+# (see run_validation_ade's docstring) and lives on a different y-axis scale
+# (meters) than the diffusion loss above.
+ade_epochs = [k for k, v in val_ade.items() if v is not None]
+if ade_epochs:
+    plt.figure(figsize=(12, 6))
+    plt.plot(ade_epochs, [val_ade[k]["ade1s"] for k in ade_epochs], marker="o", label="ADE@1s")
+    plt.plot(ade_epochs, [val_ade[k]["ade2s"] for k in ade_epochs], marker="o", label="ADE@2s")
+    plt.plot(ade_epochs, [val_ade[k]["ade3s"] for k in ade_epochs], marker="o", label="ADE@3s")
+    plt.plot(ade_epochs, [val_ade[k]["avgade"] for k in ade_epochs], marker="s", linestyle="--", label="Avg ADE")
+    plt.xlabel("Epoch")
+    plt.ylabel("ADE (m)")
+    plt.title(f"Validation ADE per Epoch (n={ADE_EVAL_SAMPLES} sampled, every {ADE_EVAL_EVERY} epochs)")
+    plt.xticks(rotation=45)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("val_ade_graph.jpg", dpi=300, bbox_inches="tight")
+    plt.show()
+else:
+    print("No validation ADE was recorded (val set empty, or every attempt OOM'd) -- skipping the ADE plot.")

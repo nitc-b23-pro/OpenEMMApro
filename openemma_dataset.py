@@ -50,6 +50,34 @@ generator function, reused by generate_intents.py so that script doesn't
 re-implement (and risk drifting from) this exact logic. __init__'s own
 behavior/output is unchanged by this refactor -- it's the same
 computation, just factored out.
+
+ADDED (fut_class, cur_pos/cur_vel/fut_world -- for training-time class
+balancing and real-ADE tracking, NEITHER is a model input):
+- fut_class: a coarse maneuver label (route_intent.label_for_delta on the
+  heading change of THIS SAMPLE's own fut window, i.e. exactly the 10
+  steps the diffusion head is trained to predict) -- "continue straight",
+  "bear left"/"bear right", "left turn"/"right turn", or "u-turn". Used
+  ONLY as a sampling-weight key by train_openemma_tinyvla.py's
+  --balance-classes (WeightedRandomSampler) and by scene_diagnostics.py.
+  It is never fed into the model, so computing it from the target window
+  itself raises no leakage concern -- that's different from the
+  route-navigation `intent` TEXT fed into the prompt, which is
+  deliberately derived from BEYOND the target window for exactly that
+  reason (see route_intent.py's docstring). Using the target to decide
+  how often to SAMPLE an example is standard difficulty-based resampling,
+  not a label leak.
+- cur_pos / cur_vel: the vehicle's own world-frame (x, y) position and
+  velocity at the last OBSERVED frame (i + OBS_LEN - 1) -- the same
+  reference point main.py's predict_step reconstructs a predicted
+  trajectory from (current position, plus heading derived from the last
+  observed velocity vector).
+- fut_world: the GT world-frame (x, y) positions for the FUT_LEN steps
+  being predicted.
+These three let train_openemma_tinyvla.py compute REAL ADE (in meters,
+via the exact same IntegrateCurvatureForPoints reconstruction main.py
+uses) directly from a validation sample, with no image/cv2/YOLO3D
+dependency and no second pass over nuScenes -- see
+train_openemma_tinyvla.py's run_validation_ade().
 """
 import json
 import os
@@ -59,6 +87,7 @@ import torch
 from nuscenes import NuScenes
 from utils import EstimateCurvatureFromTrajectory   # your existing file, unchanged
 from prompts import build_prompt, OBS_LEN as _OBS_LEN, FUT_LEN as _FUT_LEN
+from route_intent import segment_heading_change_deg, label_for_delta
 
 OBS_LEN, FUT_LEN = _OBS_LEN, _FUT_LEN
 TTL_LEN = OBS_LEN + FUT_LEN
@@ -69,13 +98,21 @@ DT = 0.5   # nuScenes keyframes are 2 Hz
 def iter_scene_motion(nusc):
     """
     Walks every scene in `nusc` once, yielding
-    (scene_name, image_paths, speed, curv, world) for every scene with at
-    least TTL_LEN frames. speed/curv/world are FULL per-scene arrays (one
-    entry per keyframe), not cropped to OBS_LEN/FUT_LEN -- a caller that
-    needs more look-ahead than a single obs/fut window (e.g.
+    (scene_name, image_paths, speed, curv, world, vel) for every scene with
+    at least TTL_LEN frames. speed/curv/world/vel are FULL per-scene arrays
+    (one entry per keyframe), not cropped to OBS_LEN/FUT_LEN -- a caller
+    that needs more look-ahead than a single obs/fut window (e.g.
     generate_intents.py, which looks past the prediction window for a
     navigator-style intent) can slice these directly instead of
     recomputing curvature/speed itself.
+
+    ADDED: `vel` (the raw per-frame world-frame velocity VECTOR, not just
+    its norm) is now also yielded -- OpenEMMADataset needs it to recover
+    the heading at a window's last observed frame (atan2(vel_y, vel_x)),
+    the same way main.py's predict_step does, so training-time ADE
+    tracking can reconstruct a trajectory without re-deriving this itself.
+    Existing callers that only unpacked 5 values need a one-token update
+    (generate_intents.py has already been updated).
     """
     for scene in nusc.scene:
         name = scene["name"]
@@ -100,25 +137,39 @@ def iter_scene_motion(nusc):
         curv = EstimateCurvatureFromTrajectory(world)
         speed = np.linalg.norm(vel, axis=1)
 
-        yield name, images, speed, curv, world
+        yield name, images, speed, curv, world, vel
 
 
 class OpenEMMADataset(torch.utils.data.Dataset):
     def __init__(self, dataroot="datasets/NuScenes", version="v1.0-test", intents_path=None):
         self.nusc = NuScenes(version=version, dataroot=dataroot)
 
-        self.samples = []   # each entry: dict(image_path=..., obs=..., fut=..., scene=..., sample_id=...)
-        for name, images, speed, curv, world in iter_scene_motion(self.nusc):
+        self.samples = []   # each entry: dict(image_path, obs, fut, scene, sample_id, fut_class, cur_pos, cur_vel, fut_world)
+        for name, images, speed, curv, world, vel in iter_scene_motion(self.nusc):
             for i in range(len(images) - TTL_LEN):
                 obs = np.stack([speed[i:i+OBS_LEN], curv[i:i+OBS_LEN] * 100], axis=1)   # (10,2)
                 fut = np.stack([speed[i+OBS_LEN:i+TTL_LEN],
                                  curv[i+OBS_LEN:i+TTL_LEN] * 100], axis=1)               # (10,2)
+
+                # ADDED (fut_class): coarse maneuver label of THIS sample's
+                # own prediction target, for sampling-weight use only (see
+                # this file's module docstring) -- never fed to the model.
+                fut_delta_deg = segment_heading_change_deg(curv[i+OBS_LEN:i+TTL_LEN], speed[i+OBS_LEN:i+TTL_LEN])
+                fut_class = label_for_delta(fut_delta_deg)
+
                 self.samples.append(dict(
                     image_path=images[i + OBS_LEN - 1],
                     obs=obs.astype(np.float32),
                     fut=fut.astype(np.float32),
                     scene=name,
                     sample_id=f"{name}__{i}",
+                    fut_class=fut_class,
+                    # ADDED: world-frame position/velocity/future-positions
+                    # for training-time ADE tracking (meters, 2D x,y only --
+                    # see module docstring).
+                    cur_pos=world[i + OBS_LEN - 1, :2].astype(np.float32),
+                    cur_vel=vel[i + OBS_LEN - 1, :2].astype(np.float32),
+                    fut_world=world[i + OBS_LEN:i + TTL_LEN, :2].astype(np.float32),
                 ))
 
         # ADDED: optional {sample_id: intent_string} lookup, produced offline
@@ -146,4 +197,9 @@ class OpenEMMADataset(torch.utils.data.Dataset):
             scene=s["scene"],
             sample_id=s["sample_id"],
             intent=intent if intent is not None else "",
+            # ADDED (not model inputs -- see module docstring):
+            fut_class=s["fut_class"],
+            cur_pos=torch.from_numpy(s["cur_pos"]),
+            cur_vel=torch.from_numpy(s["cur_vel"]),
+            fut_world=torch.from_numpy(s["fut_world"]),
         )

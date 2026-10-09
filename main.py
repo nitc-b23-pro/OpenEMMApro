@@ -239,19 +239,30 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
             OverlayTrajectory(img, pred_traj.tolist(), current_camera_params, current_ego_pose, color=(255, 0, 0), args=args)
 
             # Compute ADE.
+            # FIXED (2D vs 3D ADE inconsistency): pred_traj's z column is
+            # always exactly 0 (IntegrateCurvatureForPoints only
+            # reconstructs x,y), while fut_ego_traj_world's z is the GT
+            # elevation -- comparing all 3 axes silently mixed a
+            # meaningless z-mismatch into every ADE number before this fix.
+            # Compare x,y only, consistent with
+            # train_openemma_tinyvla.py's run_validation_ade (which only
+            # ever has x,y to begin with). This means ADE numbers from
+            # before vs after this fix are not perfectly apples-to-apples
+            # -- expect a small (usually sub-meter) decrease, not a sign
+            # anything else changed.
             fut_ego_traj_world = np.array(fut_ego_traj_world)
-            ade = np.mean(np.linalg.norm(fut_ego_traj_world[:pred_len] - pred_traj, axis=1))
+            ade = np.mean(np.linalg.norm(fut_ego_traj_world[:pred_len, :2] - pred_traj[:pred_len, :2], axis=1))
 
             pred1_len = min(pred_len, 2)
-            ade1s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred1_len] - pred_traj[:pred1_len], axis=1))
+            ade1s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred1_len, :2] - pred_traj[:pred1_len, :2], axis=1))
             ade1s_list.append(ade1s)
 
             pred2_len = min(pred_len, 4)
-            ade2s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred2_len] - pred_traj[:pred2_len], axis=1))
+            ade2s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred2_len, :2] - pred_traj[:pred2_len, :2], axis=1))
             ade2s_list.append(ade2s)
 
             pred3_len = min(pred_len, 6)
-            ade3s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred3_len] - pred_traj[:pred3_len], axis=1))
+            ade3s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred3_len, :2] - pred_traj[:pred3_len, :2], axis=1))
             ade3s_list.append(ade3s)
 
             # Write to image.

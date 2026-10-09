@@ -88,7 +88,7 @@ def build_intents(nusc, lookahead_offset, lookahead_steps, segment_steps, max_se
     """
     intents = {}
     n_scenes = 0
-    for name, images, speed, curv, world in iter_scene_motion(nusc):
+    for name, images, speed, curv, world, vel in iter_scene_motion(nusc):   # CHANGED: iter_scene_motion now also yields vel (unused here)
         n_scenes += 1
         for i in range(len(images) - TTL_LEN):
             sample_id = f"{name}__{i}"
