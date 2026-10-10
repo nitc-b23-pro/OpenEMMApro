@@ -293,7 +293,7 @@ def preprocess_batch(batch):
     # fp16 here makes that round-trip land on fp16, matching mm_projector.
     return padded.cuda(), torch.stack(images_list).cuda().half()
 
-EPOCHS = 20
+EPOCHS = 40
 DT_ADE = 0.5   # nuScenes keyframes are 2 Hz -- matches DT in openemma_dataset.py / main.py
 ADE_EVAL_EVERY = args.ade_eval_every
 ADE_EVAL_SAMPLES = args.ade_eval_samples
