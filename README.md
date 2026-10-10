@@ -1,146 +1,150 @@
-<p align="center" width="60%">
-<img src="assets/logo.png" alt="OpenEMMA" style="width: 35%; min-width: 200px; display: block; margin: auto; background-color: transparent;">
-</p>
+# OpenEMMApro — Open Source End to End Multimodal Model for Autonomous Driving
 
-<p align="center">
-    <a href="README.md"><strong>English</strong></a> | <a href="README_zh-CN.md"><strong>中文</strong></a> | <a href="README_ja-JP.md"><strong>日本語</strong></a>
-</p>
+End-to-end Vision‑Language‑Action pipeline for autonomous-driving trajectory prediction. A fork/derivative of **OpenEMMA** (open-source reimplementation of Waymo's **EMMA** — arXiv:2412.15208) that replaces OpenEMMA's free-text chain-of-thought + regex-parsed numbers with a **diffusion policy head** bolted onto a **LLaVA‑Pythia** VLM backbone, fine-tuned with **LoRA** — so the model goes straight from (image, motion history) to (future speed, curvature) numbers with no text generation and no parsing step anywhere in the loop.
 
-<div id="top" align="center">
+## Why this exists
 
-![Code License](https://img.shields.io/badge/Code%20License-Apache%202.0-brightgreen)
-[![arXiv](https://img.shields.io/badge/arXiv-2412.15208-b31b1b.svg)](https://arxiv.org/abs/2412.15208)
+EMMA's own framing (quoted directly from the paper, and the philosophy this project inherits) is that hand-designed interfaces between perception, planning, and control become a ceiling on generalization, and that splitting a driving stack into separately-trained modules means the system can never be jointly optimized toward the real objective. EMMA's fix is to put everything inside one function, `O_trajectory = G(T_intent, T_ego, V)`, with no module boundaries in between.
 
-</div>
+OpenEMMA reproduces that idea without EMMA's compute budget by doing pure prompting over an off-the-shelf MLLM — no fine-tuning — but it reintroduces exactly the kind of fragile hand-designed interface EMMA was trying to remove: the model writes a sentence containing the predicted numbers, and a regex scrapes them back out, with retry loops when the format doesn't parse. **OpenEMMA‑TinyVLA's whole point is removing that one remaining interface**: swap the output head from free-text generation to a diffusion policy head that reads the backbone's hidden states directly and emits exactly 10 × (speed, curvature) numbers, every time, with one backbone forward pass instead of an autoregressive text loop.
 
+## What changed, relative to OpenEMMA
 
-# OpenEMMA: Open-Source Multimodal Model for End-to-End Autonomous Driving
-**OpenEMMA** is an open-source implementation of  [Waymo's End-to-End Multimodal Model for Autonomous Driving (EMMA)](https://waymo.com/blog/2024/10/introducing-emma/), offering an end-to-end framework for motion planning in autonomous vehicles. **OpenEMMA** leverages the pretrained world knowledge of Vision Language Models  (VLMs), such as GPT-4 and LLaVA, to integrate text and front-view camera inputs, enabling precise predictions of future ego waypoints and providing decision rationales. Our goal is to provide accessible tools for researchers and developers to advance autonomous driving research and applications.
+- **Removed** the YOLO3D bounding-box module (external, bolted-on, orthogonal to the actual prediction path — kept in the inference script only for optional visualization overlays).
+- **Replaced the backbone** with LLaVA‑Pythia (1.3B params, from the TinyVLA project).
+- **Added LoRA** (`peft`, r=64, α=256, dropout=0.05) on both the ViT and the Pythia/GPT‑NeoX decoder's linear layers.
+- **Replaced the text-generation head with a Diffusion Policy Head** (`ConditionalUnet1D`, "droid_diffusion", from TinyVLA's `policy_heads`), trained full-parameter (not LoRA) — matching TinyVLA's own split of LoRA-tuned VLM + full-parameter diffusion head.
+- **No chain-of-thought text anymore.** Since the model never generates text at all, it can't produce OpenEMMA's Scene Description / Critical Object / Intent Description sub-steps. Instead, a single shared prompt (`prompts.py`) is written to implicitly motivate that same reasoning inside the backbone's hidden states, without ever emitting it as text.
+- **Route intent, re-added — but geometry-only.** An earlier VLM-generated "describe the maneuver" intent was replaced with a deterministic, map-free "turn-by-turn navigator" phrase (`route_intent.py` / `generate_intents.py`) derived purely from the ego vehicle's own recorded path curvature and speed — never from scene content, nearby agents, or critical-object reasoning. It reads like Google Maps announcing "next left turn," not a dashcam narrator describing traffic.
 
-<div align="center">
-  <img src="assets/EMMA-Paper-1__3_.webp" alt="EMMA diagram" width="800"/>
-  <p><em>Figure 1. EMMA: Waymo's End-to-End Multimodal Model for Autonomous Driving.</em></p>
-</div>
+## Architecture
 
-<div align="center">
-  <img src="assets/openemma-pipeline.png" alt="OpenEMMA diagram" width="800"/>
-  <p><em>Figure 2. OpenEMMA: Our Open-Source End-to-End Autonomous Driving Framework based on Pre-trained VLMs.</em></p>
-</div>
+```
+front camera image ──┐
+                      ├─► LLaVA-Pythia (ViT + GPT-NeoX, LoRA r=64/α=256) ──► hidden states
+10×[speed,curv] hist ─┘        │
+prompt (+ optional intent) ────┘
+                                                 │
+                                                 ▼
+                              ConditionalUnet1D diffusion policy head
+                              (DDIM, 100 train / 10 inference steps,
+                               FiLM-conditioned U-Net, state_dim=20,
+                               action_dim=2, chunk_size=10)
+                                                 │
+                                                 ▼
+                              10 × [speed, curvature] (future)
+                                                 │
+                                                 ▼
+                    kinematic bicycle-model integration → (x, y) trajectory
+```
 
-### News
-- **[2025/1/12]** 🔥**OpenEMMA** is now available as a PyPI package! You can install it using `pip install openemma`. 
-- **[2024/12/19]** 🔥We released **OpenEMMA**, an open-source project for end-to-end motion planning in autonomous driving tasks. Explore our [paper](https://arxiv.org/abs/2412.15208) for more details.
+- **Diffusion process**: `diffusers.DDIMScheduler`, 100 training timesteps, `squaredcos_cap_v2` schedule, `prediction_type="epsilon"`. Training adds noise to the GT action chunk at a random timestep and regresses the injected noise (MSE, masked by padding). Inference starts from pure Gaussian noise and denoises over 10 re-spaced DDIM steps.
+- **Conditioning**: backbone hidden states are mean-pooled, layer-normed, concatenated with the 20-dim motion-history state vector, and linearly projected back to hidden size; this plus a sinusoidal timestep embedding conditions every residual block in the U-Net via FiLM.
+- **Output → trajectory**: the head's (speed, curvature) outputs are integrated via the same bicycle-model math as upstream OpenEMMA (heading from ∫curvature·speed, then velocity components, then position) — never regressed directly as (x, y).
+- **Training split**: LoRA params at `2e-4`, diffusion-head params at `2e-5` (two optimizer param groups — the head starts from nothing and needs a higher relative learning rate than the already-pretrained LoRA adapters, though see *Known limitations* below).
 
-### Table of Contents
-- [Demos](#demos)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Contact](#contact)
-- [Citation](#citation)
+## Repository layout
 
-### Demos
-![](assets/scene-0061.gif)
+| File | Role |
+|---|---|
+| `openemma_dataset.py` | nuScenes → PyTorch `Dataset`. Builds `(image_path, prompt, history[10,2], future[10,2])` samples; scene-level train/val split; optional precomputed-intent lookup; `iter_scene_motion()` is the single shared scene-walk + curvature/speed computation reused by every other script below. |
+| `route_intent.py` | Deterministic, map-free "turn-by-turn navigator" intent classifier — pure curvature/speed geometry, no image, no VLM, no GPU. |
+| `generate_intents.py` | Offline pass: runs `route_intent.py` over every sample window in a dataroot/version and writes a `{sample_id: intent_string}` JSON cache. |
+| `prompts.py` | The one shared prompt builder used identically by training and inference. |
+| `main.py` | Inference entrypoint: loads a trained checkpoint, runs it over nuScenes scenes, computes ADE@1s/2s/3s, writes overlay videos/plots. |
+| `train_openemma_tinyvla.py` | Training loop: LoRA + diffusion-head fine-tuning, scene-level train/val split, class-balanced sampling, periodic ADE eval, NaN-loss guard, per-epoch loss logging. |
+| `eval_train_vs_test.py` | Runs inference + ADE evaluation twice — on scenes the model trained on vs. genuinely unseen scenes — and plots the gap as an overfitting signal. |
+| `scene_diagnostics.py` | Zero-GPU diagnostic: joins nuScenes' own scene descriptions + per-scene motion stats against an ADE results file to check whether harder (higher-curvature / higher-speed-variance) scenes are the ones with worse ADE. |
+| `plot_losses.py` | Standalone re-plot of train/val loss per epoch from the JSON files `train_openemma_tinyvla.py` writes, without re-running training. |
+| `_test_consistency.py` | Unit test for `route_intent_for_window` against synthetic straight/left/right/mixed scenes. |
+| `resume_faangpath.tex` | *(unrelated personal document — not part of the pipeline.)* |
 
-![](assets/scene-0103.gif)
+## Setup
 
-![](assets/scene-1077.gif)
+```bash
+pip install torch torchvision diffusers transformers peft nuscenes-devkit opencv-python matplotlib pillow
+```
 
-### Installation  
-To get started with OpenEMMA, follow these steps to set up your environment and dependencies.
+Also needs the vendored `llava-pythia/` package (TinyVLA's LLaVA‑Pythia implementation, with local patches for current-`transformers` compatibility) and `openemma/YOLO3D/` (only required if running with visualization overlays). Point `BASE_PRETRAINED` / `PRETRAINED` (top of `main.py` / `train_openemma_tinyvla.py`) at your local LLaVA‑Pythia checkpoint directory.
 
-1. **Environment Setup**  
-   Set up a Conda environment for OpenEMMA with Python 3.8:
-   ```bash
-   conda create -n openemma python=3.8
-   conda activate openemma
-   ```
-2. **Install OpenEMMA**   
-You can now install OpenEMMA with a single command using PyPI:
-    ```bash
-    pip install openemma
-    ```
-    Alternatively, follow these steps:
-    - **Clone OpenEMMA Repository**   
-        Clone the OpenEMMA repository and navigate to the root directory:
-        ```bash
-        git clone git@github.com:taco-group/OpenEMMA.git
-        cd OpenEMMA
-        ```
-    - **Install Dependencies**  
-        Ensure you have cudatoolkit installed. If not, use the following command:
-        ```bash
-        conda install nvidia/label/cuda-12.4.0::cuda-toolkit
-        ```
-        To install the core packages required for OpenEMMA, run the following command:
-        ```bash
-        pip install -r requirements.txt
-        ```
-        This will install all dependencies, including those for YOLO-3D, an external tool used for critical object detection. The weights needed to run YOLO-3D will be automatically downloaded during the first execution.
+## Usage
 
-3. **Set up GPT-4 API Access**  
-    To enable GPT-4’s reasoning capabilities, obtain an API key from OpenAI. You can add your API key directly in the code where prompted or set it up as an environment variable:
-    ```bash
-    export OPENAI_API_KEY="your_openai_api_key"
-    ```
-    This allows OpenEMMA to access GPT-4 for generating future waypoints and decision rationales.
+**Generate route-intent cache** (optional — `--no-intent` skips this and drops the intent line from the prompt):
 
-### Usage  
-After setting up the environment, you can start using OpenEMMA with the following instructions:
+```bash
+python generate_intents.py --dataroot <train_dataroot> --version v1.0-test --output intents_v1.0-test.json
+python generate_intents.py --dataroot <mini_dataroot>  --version v1.0-mini --output intents_v1.0-mini.json
+```
 
-1. **Prepare Input Data**   
-    Download and extract the [nuScenes dataset](https://www.nuscenes.org/nuscenes#download)
-    
-2. **Run OpenEMMA**  
-    Use the following command to execute OpenEMMA's main script:
-    - PyPI:
-    ```bash
-    openemma \
-        --model-path qwen \
-        --dataroot [dir-of-nuScenes-dataset] \
-        --version [version-of-nuScenes-dataset] \
-        --method openemma
-    ```
-    - Github Repo:
-    ```bash
-    python main.py \
-        --model-path qwen \
-        --dataroot [dir-of-nuscnse-dataset] \
-        --version [version-of-nuscnse-dataset] \
-        --method openemma
-    ```
+**Train**:
 
-    Currently, we support the following models: `GPT-4o`, `LLaVA-1.6-Mistral-7B`, `Llama-3.2-11B-Vision-Instruct`, and `Qwen2-VL-7B-Instruct`. To use a specific model, simply pass `gpt`, `llava`, `llama`, and `qwen`as the argument to `--model-path`.
+```bash
+python train_openemma_tinyvla.py                    # LoRA + diffusion head, intent on, class-balanced sampling
+python train_openemma_tinyvla.py --no-intent --no-balance-classes
+```
 
-3. **Output Interpretation**   
-    After running the model, OpenEMMA generates the following output in the `./qwen-results` location:
+**Run inference + ADE evaluation**:
 
-    - **Waypoints**: A list of future waypoints predicting the ego vehicle’s trajectory.
+```bash
+python main.py --epoch <checkpoint_dir> --dataroot <dataroot> --version v1.0-mini
+```
 
-    - **Decision Rationales**: Text explanations of the model’s reasoning, including scene context, critical objects, and behavior decisions.
+**Train-vs-unseen-scene comparison**:
 
-    - **Annotated Images**: Visualizations of the planned trajectory and detected critical objects overlaid on the original images.
+```bash
+python eval_train_vs_test.py --epoch <checkpoint_dir> \
+    --train-dataroot <train_dataroot> --train-version v1.0-test \
+    --test-dataroot <mini_dataroot> --test-version v1.0-mini
+```
 
-    - **Compiled Video**: A video (e.g., `output_video.mp4`) created from the annotated images, showing the predicted path over time.
+**Re-plot losses / diagnose hard scenes** (no GPU needed):
 
-## Contact
-For help or issues using this package, please submit a GitHub issue.
+```bash
+python plot_losses.py
+python scene_diagnostics.py --dataroot <dataroot> --version <version> --ade-results <ade_results.jsonl>
+```
 
-For personal communication related to this project, please contact Shuo Xing (shuoxing@tamu.edu).
+## Dataset
 
-## Citation
-We are more than happy if this code is helpful to your work. 
-If you use our code or extend our work, please consider citing our paper:
+Trained on **nuScenes v1.0-test** (150 scenes) — usable here because ground truth comes only from `ego_pose`, never from the withheld `sample_annotation` labels. Evaluated on **nuScenes-mini** (10 scenes), held out entirely. Each sample is a sliding window: 10 past + 10 future `[speed, curvature]` steps (0.5s apart) plus the front-camera image at the window boundary.
 
-```bibtex
+## Results
 
-@article{openemma,
-	author = {Xing, Shuo and Qian, Chengyuan and Wang, Yuping and Hua, Hongyuan and Tian, Kexin and Zhou, Yang and Tu, Zhengzhong},
-	title = {OpenEMMA: Open-Source Multimodal Model for End-to-End Autonomous Driving},
-	journal = {arXiv},
-	year = {2024},
-	month = dec,
-	eprint = {2412.15208},
-	doi = {10.48550/arXiv.2412.15208}
-}
+**Earlier OpenEMMA-method reproduction** (nuScenes-mini, 10 scenes, CoT + text-generation pipeline):
 
+| Model | ADE@1s | ADE@2s | ADE@3s | avg ADE |
+|---|---|---|---|---|
+| LLaVA-7B | 1.90 | 1.82 | 2.50 | 2.07 |
+| Qwen2.5-VL-3B | 0.87 | 1.52 | 2.19 | 1.53 |
 
+(~1 min 30 s/frame — the main practical motivation, alongside output reliability, for moving to a diffusion head.)
+
+**OpenEMMA‑TinyVLA (no‑CoT, diffusion head)**, nuScenes-mini, 10 scenes, 5 epochs of fine-tuning:
+
+| | ADE@1s | ADE@2s | ADE@3s | avg ADE | failure % |
+|---|---|---|---|---|---|
+| **Mean over 10 scenes** | 3.809 | 6.407 | 9.054 | 6.423 | 3.33 |
+
+Currently worse than the CoT baselines above. Suspected causes: only 5 training epochs; the diffusion head is trained entirely from scratch (no prior exposure to driving data) while LoRA only has to nudge an already-strong pretrained representation — a training-balance problem between the two; only 150 training scenes; and nuScenes provides no ground-truth navigation intent, so unlike OpenEMMA's self-generated CoT intent, this pipeline currently has no explicit representation of *where the vehicle is headed*, only how it has moved so far.
+
+## Known limitations / next steps
+
+- Train for more epochs and on the full nuScenes dataset rather than a 150-scene slice.
+- Rebalance the LoRA-vs-diffusion-head learning-rate split (likely slower for LoRA, higher for the head, given the head trains from scratch).
+- No ground-truth route/navigation intent is available from nuScenes; the geometry-only `route_intent.py` intent is a *partial* substitute, derived only from where the car already went, not from an actual planned route.
+
+## Fixed bugs worth knowing about
+
+- `LlavaPythiaForCausalLM` ships with no working `.generate()` — required a manual decoding loop before the diffusion head replaced text output entirely.
+- `LoraConfig` needs `modules_to_save=["embed_out", "proj_to_action"]` or the diffusion head is silently dropped from saved checkpoints.
+- Loading a trained checkpoint must use `PeftModel.from_pretrained(...)`, not a fresh `get_peft_model(...)` call, or inference silently runs on random untrained weights.
+- **NaN loss root cause**: `from_pretrained()`'s fast-init path leaves `Conv1d`/`GroupNorm` params inside the new diffusion head as raw uninitialized memory (`GPTNeoXPreTrainedModel._init_weights()` doesn't know those layer types) — fixed by explicitly calling `reset_parameters()` on them right after load, before `get_peft_model()`.
+- fp16/fp32 dtype mismatches after loading a trained LoRA/head checkpoint onto an fp16 base — fixed by upcasting `lora_`/`embed_out`/`proj_to_action` params back to fp32 post-load.
+- OOM on 14–16GB GPUs — fp16 base weights, `attn_implementation="sdpa"`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, gradient checkpointing, batch size 2 with grad-accum 2, and an OOM try/except that skips a bad micro-batch rather than killing the run.
+- A non-finite-loss guard in the training loop skips (no backward/step) any batch whose loss isn't finite, since one NaN gradient otherwise permanently poisons AdamW's running moment estimates.
+
+## References
+
+- EMMA: End-to-End Multimodal Model for Autonomous Driving — arXiv:2410.23262
+- OpenEMMA — arXiv:2412.15208
+- TinyVLA — arXiv:2409.12514
