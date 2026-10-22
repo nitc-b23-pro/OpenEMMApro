@@ -80,10 +80,19 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 # pretrained backbone, a larger one for the from-scratch diffusion head.
 lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" not in n]
 head_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" in n]
-optimizer = torch.optim.AdamW([
+param_groups = [
     {"params": lora_params, "lr": 2e-4},
     {"params": head_params, "lr": 2e-5},
-])
+]
+try:
+    # 8-bit optimizer state (bitsandbytes) instead of AdamW's usual two
+    # fp32 moment buffers per parameter -- roughly a 4x cut in optimizer
+    # memory, which matters once the GPU is already tight from the 4-bit
+    # backbone + activations (see build_model.py's USE_4BIT).
+    import bitsandbytes as bnb
+    optimizer = bnb.optim.PagedAdamW8bit(param_groups)
+except ImportError:
+    optimizer = torch.optim.AdamW(param_groups)
 
 
 def preprocess_batch(batch):

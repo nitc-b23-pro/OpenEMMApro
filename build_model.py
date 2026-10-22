@@ -18,7 +18,23 @@ import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from peft import LoraConfig, PeftModel, get_peft_model
 from policy_heads.models import ConditionalUnet1D
-from transformers import Qwen2_5_VLForConditionalGeneration
+from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
+
+try:
+    import bitsandbytes  # noqa: F401
+    from peft import prepare_model_for_kbit_training
+    BNB_AVAILABLE = True
+except ImportError:
+    BNB_AVAILABLE = False
+
+# Load the frozen backbone in 4-bit (QLoRA-style) when bitsandbytes is
+# available -- the backbone's own weights never need to update, so the
+# precision loss only affects the (frozen) forward pass, not what LoRA
+# learns. On a GPU with ~15GB this is the difference between fitting and
+# not: a 3B-param fp16 backbone alone is already ~7GB, before any LoRA
+# deltas, optimizer state, or activations. Set OPENEMMA_USE_4BIT=0 to force
+# fp16 loading instead (e.g. for debugging numerics).
+USE_4BIT = BNB_AVAILABLE and os.environ.get("OPENEMMA_USE_4BIT", "1") != "0"
 
 ACTION_DIM = 2    # [speed, curvature] per predicted step
 STATE_DIM = 20    # 10 history steps x 2 numbers, flattened
@@ -45,9 +61,14 @@ def find_linear_names(model):
 class OpenEMMAPolicy(nn.Module):
     """LoRA-wrapped Qwen2.5-VL backbone + a diffusion policy head."""
 
-    def __init__(self, backbone, hidden_size):
+    def __init__(self, backbone, hidden_size, backbone_is_quantized=False):
         super().__init__()
         self.backbone = backbone
+        # A 4-bit-quantized backbone is already placed on its device via
+        # device_map at load time; transformers raises if you then call
+        # .cuda()/.to() on it again. So when quantized, .cuda()/.to() only
+        # move this policy's own (unquantized) diffusion head.
+        self._backbone_is_quantized = backbone_is_quantized
         self.action_dim = ACTION_DIM
         self.num_queries = CHUNK_SIZE
         self.num_inference_timesteps = 10
@@ -69,6 +90,18 @@ class OpenEMMAPolicy(nn.Module):
 
     def enable_input_require_grads(self):
         self.backbone.enable_input_require_grads()
+
+    def cuda(self, device=None):
+        if self._backbone_is_quantized:
+            self.embed_out = self.embed_out.cuda(device)
+            return self
+        return super().cuda(device)
+
+    def to(self, *args, **kwargs):
+        if self._backbone_is_quantized:
+            self.embed_out = self.embed_out.to(*args, **kwargs)
+            return self
+        return super().to(*args, **kwargs)
 
     def _hidden_states(self, input_ids, attention_mask, pixel_values, image_grid_thw):
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
@@ -110,6 +143,25 @@ class OpenEMMAPolicy(nn.Module):
         torch.save(self.embed_out.state_dict(), os.path.join(path, "diffusion_head.pt"))
 
 
+def _load_backbone(pretrained_path):
+    load_kwargs = dict(
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        ),
+        device_map={"": 0} if torch.cuda.is_available() else "cpu",
+    ) if USE_4BIT else dict(torch_dtype=torch.float16)
+
+    try:
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            pretrained_path, attn_implementation="sdpa", **load_kwargs,
+        )
+    except (TypeError, ValueError):
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained_path, **load_kwargs)
+
+
 def build_openemma(pretrained_path, trained_checkpoint_path=None):
     """
     Fresh training start: build_openemma(pretrained_path) -> brand-new
@@ -119,12 +171,9 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
     trained_checkpoint_path=...) -> loads the saved LoRA + diffusion head
     weights on top of the same base backbone.
     """
-    try:
-        backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            pretrained_path, torch_dtype=torch.float16, attn_implementation="sdpa",
-        )
-    except (TypeError, ValueError):
-        backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained_path, torch_dtype=torch.float16)
+    backbone = _load_backbone(pretrained_path)
+    if USE_4BIT:
+        backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
 
     hidden_size = backbone.config.hidden_size
 
@@ -139,14 +188,14 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
         for p in backbone.parameters():
             if p.requires_grad:
                 p.data = p.data.float()
-        return OpenEMMAPolicy(backbone, hidden_size)
+        return OpenEMMAPolicy(backbone, hidden_size, backbone_is_quantized=USE_4BIT)
 
     backbone = PeftModel.from_pretrained(backbone, trained_checkpoint_path, is_trainable=False)
     for name, p in backbone.named_parameters():
         if "lora_" in name:
             p.data = p.data.float()
 
-    model = OpenEMMAPolicy(backbone, hidden_size)
+    model = OpenEMMAPolicy(backbone, hidden_size, backbone_is_quantized=USE_4BIT)
     head_state = torch.load(os.path.join(trained_checkpoint_path, "diffusion_head.pt"), map_location="cpu")
     model.embed_out.load_state_dict(head_state)
     model.embed_out = model.embed_out.float()
