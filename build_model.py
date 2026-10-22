@@ -26,10 +26,19 @@ CHUNK_SIZE = 10   # predicted future steps
 
 
 def find_linear_names(model):
-    """All nn.Linear module names in the backbone except the output head."""
+    """
+    nn.Linear names in the language-model decoder only. The vision tower
+    (`visual.*`) is deliberately excluded: none of its own weights need to
+    update for this task, and keeping it out of LoRA means none of its
+    inputs require grad, so PyTorch skips building a backward graph
+    through it entirely instead of retaining activations for every ViT
+    layer. That's the difference between fitting on a 15GB GPU and not.
+    """
     return sorted(
         name for name, module in model.named_modules()
-        if isinstance(module, nn.Linear) and not name.endswith("lm_head")
+        if isinstance(module, nn.Linear)
+        and not name.endswith("lm_head")
+        and "visual" not in name.split(".")
     )
 
 
@@ -55,6 +64,7 @@ class OpenEMMAPolicy(nn.Module):
         )
 
     def gradient_checkpointing_enable(self, **kwargs):
+        kwargs.setdefault("gradient_checkpointing_kwargs", {"use_reentrant": False})
         self.backbone.gradient_checkpointing_enable(**kwargs)
 
     def enable_input_require_grads(self):
@@ -125,6 +135,7 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
 
     if trained_checkpoint_path is None:
         backbone = get_peft_model(backbone, lora_config)
+        backbone.print_trainable_parameters()
         for p in backbone.parameters():
             if p.requires_grad:
                 p.data = p.data.float()
