@@ -1,11 +1,31 @@
+"""
+main_qwen.py
+Inference + ADE evaluation entrypoint for the Qwen2.5-VL-3B-Instruct
+backend (build_model_qwen.py) -- the Qwen analogue of main.py (which
+drives the LLaVA-Pythia backend). Branch: kaggle-openvlm.
+
+Everything about HOW a prediction becomes an ADE number (route-intent
+lookup, kinematic bicycle-model trajectory reconstruction, per-scene
+ADE@1s/2s/3s + failure-rate aggregation, overlay video writing) is
+copied byte-for-byte from main.py's run_inference_on_scenes -- none of
+that is backbone-specific. The only things that actually change for
+Qwen are how a single prediction step turns (image, prompt) into
+model-ready tensors and how the model/processor get loaded -- see
+predict_step() and load_model_and_processors() below, and this
+repo's own pre-TinyVLA Qwen integration (git history, commit b33a7b7's
+vlm_inference()) for the message/processor pattern this reuses.
+
+load_model_and_processors()/BASE_PRETRAINED/TTL_LEN keep the same names
+main.py exports so eval_train_vs_test_qwen.py's import line is a
+one-line swap of `from main import ...` -> `from main_qwen import ...`
+(see that file). The one real signature difference: this backend has a
+single `processor` (AutoProcessor) instead of a separate tokenizer +
+image_processor, so run_inference_on_scenes()/load_model_and_processors()
+here take (model, processor) instead of (model, tokenizer, image_processor).
+"""
 import argparse
 import os
 
-# OOM mitigation (see build_model.py's docstring for the fp16/sdpa half of this
-# fix): set BEFORE torch is imported. This is literally what the "CUDA out of
-# memory" error you hit earlier suggested trying -- it reduces allocator
-# fragmentation that can trigger an OOM even when total usage looks like it
-# should fit.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import time
@@ -19,115 +39,74 @@ import torch
 from nuscenes import NuScenes
 
 import json
+from qwen_vl_utils import process_vision_info
+from transformers import AutoProcessor
+from PIL import Image
+
 from openemma.YOLO3D.inference import yolo3d_nuScenes
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
-from build_model import build_openemma_tinyvla
-from llava_pythia.mm_utils import tokenizer_image_token
-from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from transformers import AutoTokenizer, CLIPImageProcessor
-from PIL import Image
+from build_model import build_openemma_qwen
 from prompts import build_prompt
-# ADDED (route intent at inference, on-the-fly -- see run_inference_on_scenes'
-# docstring below for why this needs no precomputed JSON at eval time).
 from route_intent import route_intent_for_window
 
 OBS_LEN = 10
 FUT_LEN = 10
 TTL_LEN = OBS_LEN + FUT_LEN
 
-# BASE_PRETRAINED: the SAME base LLaVA-Pythia checkpoint path used in
-# train_openemma_tinyvla.py's PRETRAINED constant. Tokenizer/image processor
-# files live here, not in the trained-checkpoint dir below (training never
-# copies them there). Module-level so both __main__ and other scripts that
-# import load_model_and_processors() from this file don't have to repeat it.
-BASE_PRETRAINED = "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/"
+# EDIT ME: same Kaggle input path as train_openemma_qwen.py's PRETRAINED --
+# keep these two in sync (base weights/tokenizer/processor files live here,
+# never inside a trained-checkpoint dir, which only holds the LoRA adapter
+# + diffusion_head.pt).
+BASE_PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
 
 
 def load_model_and_processors(base_pretrained=BASE_PRETRAINED, trained_checkpoint_path=None):
+    model = build_openemma_qwen(base_pretrained, trained_checkpoint_path=trained_checkpoint_path).cuda().eval()
+    processor = AutoProcessor.from_pretrained(base_pretrained)
+    return model, processor
+
+
+def predict_step(image_path, obs_velocities, obs_curvatures, model, processor, intent=None):
     """
-    EXTRACTED (was inline in __main__): model/tokenizer/image_processor
-    loading, unchanged in behavior -- just callable from elsewhere (e.g.
-    eval_train_vs_test.py) without duplicating it or having to re-run this
-    whole file's __main__ block.
-    """
-    model = build_openemma_tinyvla(base_pretrained, trained_checkpoint_path=trained_checkpoint_path).cuda().eval()
-    tokenizer = AutoTokenizer.from_pretrained(base_pretrained)
-    image_processor = CLIPImageProcessor.from_pretrained(base_pretrained)
-    return model, tokenizer, image_processor
-
-
-def predict_step(image_path, obs_velocities, obs_curvatures,
-                  model, tokenizer, image_processor, intent=None):
-    """
-    One OpenEMMA-TinyVLA inference step: image + the SAME shared prompt
-    used at training time (prompts.build_prompt, via openemma_dataset.py)
-    -> diffusion head -> 10 future [speed, curvature] pairs.
-
-    ADDED: optional `intent` string, forwarded straight into build_prompt
-    exactly like openemma_dataset.py does at training time. Pass None (the
-    default) to get the exact same prompt as before this parameter existed.
-
-    FIXED: this used to reference an undefined `prev_intent` variable
-    (a NameError on every call, since no scene/object/intent text step
-    exists any more) -- it now builds the shared prompt directly from
-    this call's own observed history, exactly like training does.
+    Qwen2.5-VL analogue of main.py's predict_step: same shared prompt
+    (prompts.build_prompt), same diffusion-head output contract (a ready-
+    made (1, 10, 2) tensor via eval=True, no text/regex involved) -- only
+    the prompt -> model-input step differs, using Qwen's own chat-template
+    + qwen_vl_utils.process_vision_info pattern instead of LLaVA's
+    tokenizer_image_token + CLIPImageProcessor.
     """
     obs_norm = np.linalg.norm(obs_velocities, axis=1)
     obs_curv = obs_curvatures * 100
-    obs = np.stack([obs_norm, obs_curv], axis=1)                 # (10, 2) -- same layout as training
-    state = torch.from_numpy(obs.flatten().astype(np.float32)).unsqueeze(0).cuda()   # (1, 20)
+    obs = np.stack([obs_norm, obs_curv], axis=1)
+    state = torch.from_numpy(obs.flatten().astype(np.float32)).unsqueeze(0).cuda()
 
-    raw_lang = build_prompt(obs, intent=intent)   # identical prompt-building fn used by openemma_dataset.py at train time
-    prompt = DEFAULT_IMAGE_TOKEN + "\n" + raw_lang
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX,
-                                       return_tensors="pt").unsqueeze(0).cuda()
+    raw_lang = build_prompt(obs, intent=intent)   # identical prompt-building fn used by the LLaVA-Pythia backend
 
     img = Image.open(image_path).convert("RGB")
-    # FIXED (dtype mismatch, same root cause as train_openemma_tinyvla.py's
-    # preprocess_batch(): build_model.py loads the base VLM -- including
-    # mm_projector, plain nn.Linear with no LoRA/PEFT dtype auto-casting -- in
-    # fp16. CLIPVisionTower casts its output back to match whatever dtype the
-    # input image tensor was, so it must already be fp16 here.
-    image_tensor = image_processor.preprocess(img, return_tensors="pt")["pixel_values"].cuda().half()
+    message = [{"role": "user", "content": [
+        {"type": "image", "image": img},
+        {"type": "text", "text": raw_lang},
+    ]}]
+    text = processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(message)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+    inputs = {k: v.cuda() for k, v in inputs.items()}
+    if "pixel_values" in inputs:
+        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch.float16)
 
     with torch.inference_mode():
-        # eval=True triggers the diffusion "sculptor" loop instead of text generation --
-        # it returns a ready-made (1, 10, 2) tensor, not a sentence.
-        pred = model(input_ids=input_ids, images=image_tensor, states=state, eval=True)
+        pred = model(**inputs, states=state, eval=True)
 
-    speed_curvature_pred = pred[0].cpu().numpy().tolist()   # [[speed, curv], ... x10] -- done, no regex
+    speed_curvature_pred = pred[0].cpu().numpy().tolist()
     return speed_curvature_pred, raw_lang
 
 
-def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, timestamp, args):
+def run_inference_on_scenes(nusc, scenes, model, processor, timestamp, args):
     """
-    EXTRACTED (was the inline `for scene in scenes:` block in __main__,
-    behavior unchanged): runs OpenEMMA-TinyVLA inference + ADE evaluation
-    over every scene in `scenes` (nusc.scene, or any subset of it -- e.g.
-    eval_train_vs_test.py passes it a handful of TRAINING scenes from one
-    nusc and a handful of TEST scenes from another). Returns a list of
-    per-scene result dicts (the same shape appended to
-    f"{timestamp}/ade_results.jsonl"); also writes per-frame images/videos
-    under `timestamp` when args.plot is True, exactly as before this was
-    pulled out of __main__.
-
-    ADDED (route intent at inference, on-the-fly, no precomputed JSON
-    needed): when args.use_intent, each prediction window's intent is
-    computed directly from THIS scene's own full-scene ego curvature/speed
-    via route_intent.route_intent_for_window(..., start_idx=i+args.lookahead_offset,
-    ...) -- the exact same function and default offset (TTL_LEN, i.e. AFTER
-    the prediction window) that generate_intents.py uses to label the
-    training set. There is deliberately no separate "future-blind" intent
-    generator here: the ego vehicle's OWN recorded future path is used as a
-    stand-in for an externally-known, pre-planned navigation route (the kind
-    a real self-driving stack already has before a trip starts, the same
-    way a phone's turn-by-turn navigator knows the route further out than
-    your next 10 seconds). This is evaluation-time information about the
-    ROUTE, not the withheld ground-truth motion itself, and it mirrors
-    whatever the model saw in its own training prompts -- which is exactly
-    why --use-intent here must match whatever the checkpoint being
-    evaluated was actually trained with (see this function's --use-intent
-    CLI help in __main__ / eval_train_vs_test.py).
+    Byte-for-byte main.py's run_inference_on_scenes, with its predict_step
+    call swapped for this file's Qwen version and (model, tokenizer,
+    image_processor) narrowed to (model, processor) -- see this file's
+    module docstring for why nothing else needed to change.
     """
     results = []
     local_frame_count = 0
@@ -160,7 +139,7 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
             print(f"Scene {name} has less than {TTL_LEN} frames, skipping...")
             continue
 
-        DT = 0.5  # nuScenes keyframes are 2 Hz
+        DT = 0.5
         ego_poses_world = [ego_poses[t]['translation'][:3] for t in range(scene_length)]
         ego_poses_world = np.array(ego_poses_world)
         plt.plot(ego_poses_world[:, 0], ego_poses_world[:, 1], 'r-', label='GT')
@@ -181,7 +160,7 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
 
         if args.plot:
             plt.quiver(ego_poses_world[:, 0], ego_poses_world[:, 1], ego_velocities[:, 0], ego_velocities[:, 1],
-                    color='b')
+                       color='b')
             plt.plot(estimated_points[:, 0], estimated_points[:, 1], 'g-', label='Reconstruction')
             plt.legend()
             plt.savefig(f"{timestamp}/{name}_interpolation.jpg")
@@ -207,9 +186,6 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
             img = cv2.imread(current_image)
             img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
 
-            # ADDED: route-navigation intent for this window, computed on the
-            # fly from this SAME scene's full curvature/speed arrays -- see
-            # this function's docstring for the "pre-planned route" framing.
             intent = None
             if getattr(args, "use_intent", False):
                 intent = route_intent_for_window(
@@ -218,12 +194,11 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
                 )
 
             speed_curvature_pred, raw_lang = predict_step(
-                current_image, obs_ego_velocities, obs_ego_curvatures, model, tokenizer, image_processor,
+                current_image, obs_ego_velocities, obs_ego_curvatures, model, processor,
                 intent=intent)
             speed_curvature_pred = speed_curvature_pred[:10]
             print(f"Got {len(speed_curvature_pred)} future actions: {speed_curvature_pred}")
 
-            # Pred
             pred_len = min(FUT_LEN, len(speed_curvature_pred))
             pred_curvatures = np.array(speed_curvature_pred)[:, 1] / 100
             pred_speeds = np.array(speed_curvature_pred)[:, 0]
@@ -235,21 +210,8 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
                 atan2(obs_ego_velocities[-1][1], obs_ego_velocities[-1][0]),
                 DT,
             )
-            # Overlay the trajectory.
             OverlayTrajectory(img, pred_traj.tolist(), current_camera_params, current_ego_pose, color=(255, 0, 0), args=args)
 
-            # Compute ADE.
-            # FIXED (2D vs 3D ADE inconsistency): pred_traj's z column is
-            # always exactly 0 (IntegrateCurvatureForPoints only
-            # reconstructs x,y), while fut_ego_traj_world's z is the GT
-            # elevation -- comparing all 3 axes silently mixed a
-            # meaningless z-mismatch into every ADE number before this fix.
-            # Compare x,y only, consistent with
-            # train_openemma_tinyvla.py's run_validation_ade (which only
-            # ever has x,y to begin with). This means ADE numbers from
-            # before vs after this fix are not perfectly apples-to-apples
-            # -- expect a small (usually sub-meter) decrease, not a sign
-            # anything else changed.
             fut_ego_traj_world = np.array(fut_ego_traj_world)
             ade = np.mean(np.linalg.norm(fut_ego_traj_world[:pred_len, :2] - pred_traj[:pred_len, :2], axis=1))
 
@@ -265,12 +227,10 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
             ade3s = np.mean(np.linalg.norm(fut_ego_traj_world[:pred3_len, :2] - pred_traj[:pred3_len, :2], axis=1))
             ade3s_list.append(ade3s)
 
-            # Write to image.
             if args.plot == True:
                 cam_images_sequence.append(img.copy())
                 cv2.imwrite(f"{timestamp}/{name}_{i}_front_cam.jpg", img)
 
-                # Plot the trajectory.
                 plt.plot(fut_ego_traj_world[:, 0], fut_ego_traj_world[:, 1], 'r-', label='GT')
                 plt.plot(pred_traj[:, 0], pred_traj[:, 1], 'b-', label='Pred')
                 plt.legend()
@@ -278,21 +238,15 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
                 plt.savefig(f"{timestamp}/{name}_{i}_traj.jpg")
                 plt.close()
 
-                # Save the trajectory
                 np.save(f"{timestamp}/{name}_{i}_pred_traj.npy", pred_traj)
                 np.save(f"{timestamp}/{name}_{i}_pred_curvatures.npy", pred_curvatures)
                 np.save(f"{timestamp}/{name}_{i}_pred_speeds.npy", pred_speeds)
 
-                # FIXED: this used to reference undefined scene_description /
-                # object_description / updated_intent (a guaranteed NameError,
-                # since no separate scene/object/intent text step exists any
-                # more). Logging the actual prompt used + prediction instead.
                 with open(f"{timestamp}/{name}_{i}_logs.txt", 'w') as f:
                     f.write(f"Prompt: {raw_lang}\n")
                     f.write(f"Predicted speed/curvature (x10): {speed_curvature_pred}\n")
                     f.write(f"Average Displacement Error: {ade}\n")
 
-            # --- per-call frame counter + per-frame time + running average ---
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             frame_time = time.time() - frame_start
@@ -338,46 +292,31 @@ def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, tim
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="lp")
+    parser.add_argument("--model-path", type=str, default="qwen")
     parser.add_argument("--plot", type=bool, default=True)
-    parser.add_argument("--epoch", type=str, default="/kaggle/working/OpenEMMApro/openemma_tinyvla_epoch0/")
+    parser.add_argument("--epoch", type=str, default="/kaggle/working/OpenEMMApro/openemma_qwen_epoch0/")
     parser.add_argument("--dataroot", type=str, default='datasets/NuScenes')
-    parser.add_argument("--version", type=str, default='v1.0-mini')   # <-- inference split (per project requirement)
+    parser.add_argument("--version", type=str, default='v1.0-mini')
     parser.add_argument("--method", type=str, default='openemma')
-    # ADDED: mirrors train_openemma_tinyvla.py's --use-intent/--no-intent.
-    # Default True to match that script's default -- IMPORTANT: this should
-    # match whatever the checkpoint in --epoch was actually trained with, or
-    # the prompt distribution at eval won't match training (see
-    # run_inference_on_scenes' docstring).
     parser.add_argument("--use-intent", dest="use_intent", action="store_true", default=True,
-                         help="Compute an on-the-fly route-navigation intent per window and thread it into "
-                              "the prompt, same as training (default: on). Must match the checkpoint's own "
-                              "training setting to be a fair evaluation.")
-    parser.add_argument("--no-intent", dest="use_intent", action="store_false",
-                         help="Disable intent in the prompt at inference (use if the checkpoint was trained with --no-intent).")
-    parser.add_argument("--lookahead-offset", type=int, default=TTL_LEN,
-                         help=f"Window-relative start index for the on-the-fly route intent look-ahead "
-                              f"(default {TTL_LEN} = OBS_LEN+FUT_LEN, matching generate_intents.py's default).")
+                         help="Must match the checkpoint's own training setting (default: on).")
+    parser.add_argument("--no-intent", dest="use_intent", action="store_false")
+    parser.add_argument("--lookahead-offset", type=int, default=TTL_LEN)
     args = parser.parse_args()
 
     print(f"{args.model_path}")
 
-    # TRAINED_CHECKPOINT: one of the openemma_tinyvla_epochN directories
-    # written by train_openemma_tinyvla.py's model.save_pretrained(...).
     TRAINED_CHECKPOINT = args.epoch
 
-    model, tokenizer, image_processor = load_model_and_processors(BASE_PRETRAINED, TRAINED_CHECKPOINT)
+    model, processor = load_model_and_processors(BASE_PRETRAINED, TRAINED_CHECKPOINT)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     timestamp = args.model_path + f"_results/{args.method}/" + timestamp
     os.makedirs(timestamp, exist_ok=True)
 
-    # This block extracts and prepares a time-ordered sequence of front-camera images,
-    # vehicle poses, and camera parameters from nuScenes so the driving scene can be
-    # reasoned about and future motion can be predicted.
     nusc = NuScenes(version=args.version, dataroot=args.dataroot)
 
     scenes = nusc.scene
     print(f"Number of scenes: {len(scenes)}")
 
-    run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, timestamp, args)
+    run_inference_on_scenes(nusc, scenes, model, processor, timestamp, args)

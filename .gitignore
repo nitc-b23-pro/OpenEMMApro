@@ -27,3 +27,4 @@ openemma\YOLO3D\weights\resnet18.pkl
 /assests/
 build_model.py.bak_before_inferencedtypefix
 /Claude outputs
+note.ipynb

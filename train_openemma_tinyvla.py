@@ -1,105 +1,45 @@
 """
-train_openemma_tinyvla.py
-Simple single-GPU training loop for OpenEMMA-TinyVLA.
+train_openemma_qwen.py
+Same training recipe as train_openemma_tinyvla.py -- diffusion policy
+head + LoRA, scene-level train/val split, class-balanced sampling, real
+(meters) validation ADE tracking, NaN/OOM guards -- on a Qwen2.5-VL-3B-
+Instruct backbone instead of LLaVA-Pythia (build_model_qwen.py). Branch:
+kaggle-openvlm.
 
-CHANGED (dataset split): trains on nuScenes v1.0-test (see
-openemma_dataset.py's docstring for why v1.0-test is valid here -- ground
-truth comes only from ego_pose, not from the withheld sample_annotation
-labels).
+What's identical to train_openemma_tinyvla.py (unchanged, reused as-is)
+------------------------------------------------------------------------
+- openemma_dataset.OpenEMMADataset: backbone-agnostic. It only ever
+  returns an image path + prompt TEXT (prompts.build_prompt, also
+  backbone-agnostic) + numeric state/action/is_pad tensors -- nothing
+  LLaVA-Pythia-specific. No changes needed for Qwen.
+- The scene-level train/val split (VAL_FRACTION/SPLIT_SEED), the
+  --balance-classes WeightedRandomSampler, the --use-intent /
+  intents_v1.0-test.json wiring, the two-learning-rate-group optimizer
+  split (LoRA params vs. the diffusion head), the OOM/NaN-loss guards,
+  the per-epoch loss/val-loss/val-ADE JSON logging and plotting -- all
+  identical logic, copied over unchanged.
 
-CHANGED (prompt): the dataset now builds each sample's prompt text via
-prompts.build_prompt() -- the same function main.py uses at inference --
-so there is nothing prompt-related to change here; this file already
-just forwards batch["raw_lang"] into the tokenizer, unchanged.
-
-ADDED: a global frame counter, per-frame processing time, and a running
-global-average frame-processing time, printed every logged step. "Frame"
-here means one training IMAGE (a batch of batch_size=4 contains 4
-frames), so per-frame time = this step's wall time / batch_size, and the
-running average is total accumulated time / total frames seen so far --
-directly comparable to main.py's per-frame inference timing.
-
-ADDED (OOM mitigation): PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,
-set BEFORE torch is imported -- this is literally what the "CUDA out of
-memory" error you hit earlier suggested trying, and it reduces allocator
-fragmentation that can trigger an OOM even when total usage looks like it
-should fit.
-
-ADDED (validation split + val_epoch_losses.json): dataset samples are now
-split by WHOLE SCENE into a training set and a held-out validation set
-(VAL_FRACTION of scenes, picked with a fixed seed so the split is
-reproducible across runs) -- this split is NOT behind a flag, it always
-runs. Splitting by scene, not by individual frame, matters because
-consecutive frames in the same scene come from heavily overlapping
-10-past/10-future windows -- a frame-level random split would put
-near-duplicate windows on both sides and make the validation number
-meaningless. After each epoch's training loop, the model is switched to
-eval mode and run (no_grad, no backward, no optimizer step) over the
-validation set once, using the exact same forward call and loss as
-training. The resulting per-epoch average is written to
-val_epoch_losses.json, mirroring the existing lp_epoch_loss.json format
-exactly (same {"epoch-N": avg_loss} shape).
-
-FIXED (NaN/Inf loss was silently poisoning the WHOLE epoch's average):
-previously, when a step's loss was non-finite, the code printed a warning
-and skipped backward()/optimizer.step() -- but did NOT skip the
-`s_loss += loss.item()` / `s_t += 1` bookkeeping below it. Since
-loss.item() is itself NaN/Inf in that branch, adding it to s_loss made
-EVERY subsequent addition that epoch NaN too (NaN + anything = NaN), so
-a single bad batch anywhere in an epoch would silently turn that whole
-epoch's saved average into NaN. This is now handled the same way the OOM
-branch already was: `continue` immediately after the warning, so a
-non-finite step is excluded from the epoch average instead of poisoning
-it. (The same fix is applied to the validation loop below.)
-
-ADDED (--use-intent / --no-intent CLI flag, default ON): whether each
-sample's prompt includes a route-navigation intent line (see
-route_intent.py / generate_intents.py / prompts.py) is now a command-line
-choice instead of an always-on constant. Default is --use-intent (True),
-which is "like previous" in the sense that this is the behavior that was
-already shipped. Pass --no-intent to train with the exact prompt behavior
-from before the intent feature existed at all. This matters for a clean
-comparison: a checkpoint trained with --no-intent should be evaluated
-with main.py's/eval_train_vs_test.py's --no-intent too.
-
-ADDED (--balance-classes / --no-balance-classes CLI flag, default ON):
-diagnosed from the epoch-19 inference results -- ADE was near-perfect on
-some scenes (sub-meter) and catastrophic on others (10-20+ m by 3s), and
-eval_train_vs_test.py showed this split along MANEUVER lines, not
-train/test lines: several scenes the model trained on directly were just
-as bad as the worst unseen scenes. generate_intents.py's own printed
-distribution showed why -- "continue straight" is ~75% of every training
-window regardless of which scene it's in, so uniform random sampling lets
-the majority class dominate every batch's gradient no matter how the
-scene-level split is drawn. --balance-classes computes each TRAINING
-sample's own maneuver class (openemma_dataset.py's `fut_class` -- the
-coarse label of the ACTUAL FUT window, used only as a resampling key,
-never fed to the model) and uses a WeightedRandomSampler with
-inverse-class-frequency weights so turns/bears/u-turns are seen roughly
-as often as straight-driving windows over the course of an epoch. Pass
---no-balance-classes to go back to plain uniform random sampling.
-
-ADDED (--ade-eval-every / --ade-eval-samples, real ADE tracking during
-training): the diffusion loss plotted at the end of a run lives in a
-different, non-metric feature space from ADE (trajectory displacement
-error in meters) -- IntegrateCurvatureForPoints is a nonlinear,
-error-compounding transform between the two, so a falling loss does not
-guarantee a falling ADE (this is exactly what the epoch-19 results
-showed: loss plateaued around 0.40-0.45, but ADE was several meters to
-tens of meters on a third of the evaluated scenes). Every
---ade-eval-every epochs (default 5, plus always on the final epoch),
-run_validation_ade() runs the model's ACTUAL diffusion sampling loop
-(eval=True, the same path main.py uses for inference, not the training
-loss) on an evenly-spaced subset of --ade-eval-samples validation
-examples (default 64), reconstructs each predicted trajectory with
-utils.IntegrateCurvatureForPoints (identical math to main.py), and
-compares it against openemma_dataset.py's cur_pos/cur_vel/fut_world
-fields to get a real ADE in meters -- written to val_ade_epochs.json and
-plotted (val_ade_graph.jpg) alongside the loss curves at the end of the
-run. This is deliberately bounded (a subset, not the whole validation
-set, and not every epoch) because the eval=True sampling path runs an
-iterative denoising loop per example and is far slower than a single
-training forward pass.
+What's different (Qwen-specific)
+---------------------------------
+- preprocess_batch(): LLaVA-Pythia's version hand-builds input_ids via
+  tokenizer_image_token() (a single <image> placeholder token, DIY
+  padding) and runs CLIPImageProcessor on raw images. Qwen2.5-VL has its
+  own native multimodal input format (<|image_pad|> tokens expanded to
+  match the ViT's patch grid, packed `pixel_values` + `image_grid_thw`,
+  not a per-image fixed-size tensor) built by its own AutoProcessor via
+  a chat-template message + qwen_vl_utils.process_vision_info -- see
+  this file's preprocess_batch() below. This is the exact same
+  message/processor pattern this repo's own pre-TinyVLA Qwen path used
+  (see git history: commit b33a7b7's vlm_inference()), just reused here
+  to build model inputs instead of calling .generate().
+- build_model_qwen.build_openemma_qwen() instead of build_model.
+  build_openemma_tinyvla(); model(...) is called with
+  input_ids/attention_mask/pixel_values/image_grid_thw instead of
+  input_ids/images.
+- Output file names are prefixed `qwen_` (qwen_epoch_loss.json etc.) and
+  checkpoints are written to openemma_qwen_epoch{N}/, so running this
+  alongside the LLaVA-Pythia pipeline in the same working directory
+  never overwrites its lp_*/openemma_tinyvla_epoch* outputs.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -111,95 +51,63 @@ import time
 from collections import Counter
 from math import atan2
 
-import torch
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
-from PIL import Image
 import numpy as np
+import torch
+from PIL import Image
+from qwen_vl_utils import process_vision_info
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
+from transformers import AutoProcessor
 
-from build_model import build_openemma_tinyvla
+from build_model import build_openemma_qwen
 from openemma_dataset import OpenEMMADataset
 from utils import IntegrateCurvatureForPoints
-from llava_pythia.mm_utils import tokenizer_image_token
-from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
-from transformers import AutoTokenizer, CLIPImageProcessor
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--use-intent", dest="use_intent", action="store_true", default=True,
-                         help="Thread a route-navigation intent (route_intent.py / generate_intents.py) "
-                              "into each sample's prompt, same as prompts.py's intent= argument (default: on).")
-    parser.add_argument("--no-intent", dest="use_intent", action="store_false",
-                         help="Disable intent in the prompt -- reverts to the exact prompt text from "
-                              "before the intent feature existed, regardless of whether an intents JSON is present.")
+                         help="Thread a route-navigation intent into each sample's prompt (default: on).")
+    parser.add_argument("--no-intent", dest="use_intent", action="store_false")
     parser.add_argument("--balance-classes", dest="balance_classes", action="store_true", default=True,
-                         help="Oversample rare maneuver classes (turns/bears/u-turns) relative to the dominant "
-                              "'continue straight' majority via a WeightedRandomSampler (default: on).")
-    parser.add_argument("--no-balance-classes", dest="balance_classes", action="store_false",
-                         help="Disable class balancing -- plain uniform random sampling, like before this feature existed.")
+                         help="Oversample rare maneuver classes via a WeightedRandomSampler (default: on).")
+    parser.add_argument("--no-balance-classes", dest="balance_classes", action="store_false")
     parser.add_argument("--ade-eval-every", type=int, default=5,
-                         help="Run a REAL validation ADE check (meters, via the diffusion sampling loop + "
-                              "trajectory reconstruction) every N epochs, plus always on the final epoch (default: 5).")
+                         help="Run a real validation ADE check every N epochs, plus always on the final epoch (default: 5).")
     parser.add_argument("--ade-eval-samples", type=int, default=64,
-                         help="How many validation samples (evenly spaced across the val set) the ADE check "
-                              "uses each time it runs (default: 64).")
+                         help="How many validation samples the ADE check uses each time it runs (default: 64).")
     return parser.parse_args()
 
 
 args = parse_args()
 
-PRETRAINED = "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/"   # swap in B or H later
+# EDIT ME: point this at wherever your Kaggle Notebook mounts the
+# Qwen2.5-VL-3B-Instruct input (Kaggle Models path convention, same idea
+# as train_openemma_tinyvla.py's LLaVA-Pythia PRETRAINED constant --
+# adjust the slug/variation/version segments to match your own input).
+PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
 DATAROOT = "/kaggle/working/nuscenes_test_root/"
-VERSION = "v1.0-test"   # <-- training split (per project requirement)
+VERSION = "v1.0-test"   # training split (per project requirement)
 
-# CHANGED: INTENTS_PATH is now gated by --use-intent/--no-intent (see this
-# file's module docstring). If generate_intents.py has already produced this
-# file for this exact dataroot/version, each sample's intent gets threaded
-# into its prompt via openemma_dataset.py / prompts.py. If the file doesn't
-# exist yet, OpenEMMADataset falls back to intent=None everywhere -- nothing
-# else below needs to change either way. See openemma_dataset.py's and
-# prompts.py's docstrings for the privileged-information caveat before
-# relying on this for a real run.
 INTENTS_PATH = "intents_v1.0-test.json" if args.use_intent else None
-
 if args.use_intent:
     _found = os.path.exists(INTENTS_PATH)
     print(f"Intent ENABLED: looking up {INTENTS_PATH} "
-          f"({'found' if _found else 'NOT FOUND -- every sample will fall back to no-intent prompts until generate_intents.py has been run for this dataroot/version'})")
+          f"({'found' if _found else 'NOT FOUND -- falling back to no-intent prompts until generate_intents.py has been run'})")
 else:
-    print("Intent DISABLED (--no-intent): prompts built exactly as before the intent feature existed.")
+    print("Intent DISABLED (--no-intent).")
 
-model = build_openemma_tinyvla(PRETRAINED).cuda()
-tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
-image_processor = CLIPImageProcessor.from_pretrained(PRETRAINED)
+model = build_openemma_qwen(PRETRAINED).cuda()
+processor = AutoProcessor.from_pretrained(PRETRAINED)
 
-# ADDED (OOM mitigation): step 0's forward+backward+optimizer.step() alone used
-# ~14.17 GiB of the card's 14.56 GiB, then OOM'd on step 1's forward pass.
-# AdamW allocates its exp_avg/exp_avg_sq state (2x extra memory per trainable
-# param) LAZILY, on the first optimizer.step() call -- so step 0 runs under a
-# "no optimizer state yet" budget that step 1 never gets again. Gradient
-# checkpointing trades compute for memory: instead of keeping every
-# transformer layer's activations around for backward, it recomputes them
-# on the fly, which cuts backward-pass memory substantially for a model this
-# size. `enable_input_require_grads()` is the standard companion call needed
-# when combining gradient checkpointing with a model whose input embeddings
-# are frozen (as they are here, apart from LoRA) -- without it, checkpointing
-# can silently stop gradients from flowing back through the LoRA-adapted
-# layers at all.
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 
-dataset = OpenEMMADataset(dataroot=DATAROOT, version=VERSION, intents_path=INTENTS_PATH)   # reads datasets/NuScenes
+dataset = OpenEMMADataset(dataroot=DATAROOT, version=VERSION, intents_path=INTENTS_PATH)
 
-# ADDED (scene-level train/val split, ALWAYS ON -- not a flag): group sample
-# INDICES by scene, then hold out whole scenes for validation -- never
-# individual frames -- so overlapping windows from the same scene can't leak
-# across the split.
-VAL_FRACTION = 0.1   # ~10% of scenes held out for validation
-SPLIT_SEED = 42       # fixed, so re-running the script reproduces the same split
-# NOTE: eval_train_vs_test.py reproduces this exact VAL_FRACTION/SPLIT_SEED
-# pair to recover which scenes were actually trained on (vs held out) --
-# if you change either constant here, update it there too.
+VAL_FRACTION = 0.1
+SPLIT_SEED = 42
+# NOTE: eval_train_vs_test_qwen.py reproduces this exact VAL_FRACTION/
+# SPLIT_SEED pair -- keep both in sync if you change either here.
 
 scene_names = sorted({s["scene"] for s in dataset.samples})
 rng = random.Random(SPLIT_SEED)
@@ -217,137 +125,120 @@ print(f"Scene split: {len(train_scenes)} train scenes / {len(val_scenes)} val sc
 train_dataset = Subset(dataset, train_indices)
 val_dataset = Subset(dataset, val_indices)
 
-# CHANGED (OOM mitigation): batch_size 4 -> 2. Per-step activation memory
-# scales ~linearly with batch size, and this is the single biggest lever
-# available without touching model architecture. GRAD_ACCUM_STEPS=2 below
-# accumulates gradients over 2 micro-batches of size 2 before every
-# optimizer.step(), so the *effective* batch size the model trains at (and
-# the LoRA/head learning rates were tuned for) stays 4 -- only the peak
-# memory of any single forward/backward drops.
 BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 2
 
-# ADDED (--balance-classes): see this file's module docstring for the full
-# rationale. `fut_class` is computed once per sample inside
-# OpenEMMADataset.__init__ (openemma_dataset.py) from that sample's OWN
-# future window -- it is a resampling key only, never a model input.
 train_classes = [dataset.samples[i]["fut_class"] for i in train_indices]
 class_counts = Counter(train_classes)
 print(f"Train-set maneuver class distribution (before any balancing): {dict(class_counts)}")
 
 if args.balance_classes:
-    # Inverse-frequency weight per class, rescaled so the mean weight is 1
-    # (cosmetic -- WeightedRandomSampler only cares about RELATIVE weights,
-    # this just keeps the printed numbers readable).
     class_weight = {c: 1.0 / n for c, n in class_counts.items()}
     mean_w = float(np.mean(list(class_weight.values())))
     class_weight = {c: w / mean_w for c, w in class_weight.items()}
     print(f"Class weights (--balance-classes, inverse-frequency): {class_weight}")
 
     sample_weights = [class_weight[c] for c in train_classes]
-    # num_samples=len(train_indices): each epoch still draws the SAME NUMBER
-    # of examples as before -- it's the MIX that changes (rare maneuvers
-    # repeated more often, the straight-driving majority seen relatively
-    # less often per epoch, in expectation), which is the standard, expected
-    # behavior of a weighted sampler with replacement, not a bug.
     train_sampler = WeightedRandomSampler(
         sample_weights, num_samples=len(train_indices), replacement=True,
         generator=torch.Generator().manual_seed(SPLIT_SEED),
     )
     loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler)
 else:
-    print("Class balancing DISABLED (--no-balance-classes): uniform random sampling, like before this feature existed.")
+    print("Class balancing DISABLED.")
     loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)   # val is NEVER resampled -- it should stay representative
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# Two learning rates, exactly like TinyVLA's original recipe:
-#   - a small one for the LoRA "patches" on the pretrained VLM (don't want to move it far)
-#   - a bigger one for the brand-new diffusion head (it's starting from random, needs to move more)
+# Same two-learning-rate-group recipe as train_openemma_tinyvla.py: a
+# small LR for the LoRA patches on the pretrained VLM, a bigger one for
+# the from-scratch diffusion head. The substring filter works unchanged
+# here even though the parameter names now have a `qwen.` prefix (from
+# OpenEMMAQwenPolicy) instead of none -- "embed_out"/"proj_to_action"
+# still only ever appear in the head's own parameter names.
 lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" not in n and "proj_to_action" not in n]
 head_params = [p for n, p in model.named_parameters() if p.requires_grad and ("embed_out" in n or "proj_to_action" in n)]
 optimizer = torch.optim.AdamW([
     {"params": lora_params, "lr": 2e-4},
     {"params": head_params, "lr": 2e-5},
-    # {"params": lora_params, "lr": 1e-5},
-    # {"params": head_params, "lr": 2e-4},
 ])
 
-def preprocess_batch(batch):
-    input_ids_list, images_list = [], []
-    for image_path, raw_lang in zip(batch["image_path"], batch["raw_lang"]):
-        prompt = DEFAULT_IMAGE_TOKEN + "\n" + raw_lang
-        input_ids_list.append(tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"))
-        img = Image.open(image_path).convert("RGB")
-        images_list.append(image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0])
 
-    max_len = max(x.shape[0] for x in input_ids_list)
-    padded = torch.stack([torch.nn.functional.pad(x, (0, max_len - x.shape[0]), value=tokenizer.pad_token_id)
-                           for x in input_ids_list])
-    # FIXED (dtype mismatch): build_model.py now loads the base VLM (including
-    # mm_projector, which is plain nn.Linear -- not LoRA-adapted, so there is
-    # no PEFT-level dtype auto-casting protecting it) in fp16. CLIPVisionTower's
-    # own forward() casts its OUTPUT back to match whatever dtype the INPUT
-    # image tensor was, so if we hand it fp32 here, mm_projector (fp16 weights)
-    # gets an fp32 input and F.linear crashes on the dtype mismatch. Casting to
-    # fp16 here makes that round-trip land on fp16, matching mm_projector.
-    return padded.cuda(), torch.stack(images_list).cuda().half()
+def preprocess_batch(batch):
+    """
+    Qwen2.5-VL analogue of train_openemma_tinyvla.py's preprocess_batch:
+    builds one chat-template message per sample ({"type": "image", ...} +
+    {"type": "text", "text": raw_lang}, raw_lang itself already built by
+    the SAME prompts.build_prompt() the LLaVA-Pythia backend uses), lets
+    qwen_vl_utils.process_vision_info + the processor's own batching
+    handle padding/packing (Qwen2.5-VL's `pixel_values` are flattened ViT
+    patches across the WHOLE batch, split back out per-image via
+    `image_grid_thw` -- there is no separate per-sample image tensor to
+    manually stack the way CLIPImageProcessor needed).
+    """
+    messages = []
+    for image_path, raw_lang in zip(batch["image_path"], batch["raw_lang"]):
+        img = Image.open(image_path).convert("RGB")
+        messages.append([{"role": "user", "content": [
+            {"type": "image", "image": img},
+            {"type": "text", "text": raw_lang},
+        ]}])
+
+    texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
+
+    inputs = {k: v.cuda() for k, v in inputs.items()}
+    # FIXED (dtype mismatch, same root cause as build_model_qwen.py's base
+    # model being loaded fp16): the processor returns pixel_values as
+    # fp32 by default; the frozen ViT patch-embed/merger weights are fp16.
+    if "pixel_values" in inputs:
+        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch.float16)
+    return inputs
+
 
 EPOCHS = 40
-DT_ADE = 0.5   # nuScenes keyframes are 2 Hz -- matches DT in openemma_dataset.py / main.py
+DT_ADE = 0.5
 ADE_EVAL_EVERY = args.ade_eval_every
 ADE_EVAL_SAMPLES = args.ade_eval_samples
 
-# --- global frame counter + running average frame-processing time ---
 global_frame_count = 0
 total_process_time = 0.0
 
 optimizer.zero_grad()
 
-filename = "lp_epoch_loss.json"
-val_filename = "val_epoch_losses.json"
-val_ade_filename = "val_ade_epochs.json"   # ADDED
+filename = "qwen_epoch_loss.json"
+val_filename = "qwen_val_epoch_losses.json"
+val_ade_filename = "qwen_val_ade_epochs.json"
 
-# Create the files with an empty dictionary if they don't exist yet
 losses = {}
 if not os.path.exists(filename):
-  with open(filename, "w") as file:
-    json.dump(losses, file)
+    with open(filename, "w") as file:
+        json.dump(losses, file)
 
 val_losses = {}
 if not os.path.exists(val_filename):
-  with open(val_filename, "w") as file:
-    json.dump(val_losses, file)
+    with open(val_filename, "w") as file:
+        json.dump(val_losses, file)
 
-val_ade = {}   # ADDED
-if not os.path.exists(val_ade_filename):   # ADDED
-  with open(val_ade_filename, "w") as file:   # ADDED
-    json.dump(val_ade, file)   # ADDED
+val_ade = {}
+if not os.path.exists(val_ade_filename):
+    with open(val_ade_filename, "w") as file:
+        json.dump(val_ade, file)
 
 
 def run_validation(epoch):
-    """
-    One no-grad pass over val_loader, using the exact same forward call and
-    loss as training (just no backward()/optimizer.step()), and the same
-    finite-loss guard as the training loop below. Returns the average loss
-    over the epoch, or None if every single validation step was skipped
-    (OOM / non-finite) -- which would mean something is actually wrong, not
-    just "no validation data." This is the DIFFUSION LOSS, in its own
-    normalized feature space -- see run_validation_ade() below for the real,
-    meters-space metric.
-    """
     model.eval()
     v_loss, v_t = 0.0, 0
     with torch.no_grad():
         for step, batch in enumerate(val_loader):
-            input_ids, images = preprocess_batch(batch)
+            inputs = preprocess_batch(batch)
             state = batch["state"].cuda()
             action = batch["action"].cuda()
             is_pad = batch["is_pad"].cuda()
 
             try:
-                out = model(input_ids=input_ids, images=images, states=state,
-                            actions=action, is_pad=is_pad)
+                out = model(**inputs, states=state, actions=action, is_pad=is_pad)
                 loss = out["loss"] if isinstance(out, dict) else out.loss
             except torch.OutOfMemoryError as e:
                 print(f"[val] epoch {epoch} step {step} | OOM, SKIPPING this micro-batch: {e}")
@@ -367,28 +258,12 @@ def run_validation(epoch):
 
 
 def run_validation_ade(epoch, max_samples=None):
-    """
-    ADDED. Runs the model's ACTUAL diffusion sampling loop (eval=True, the
-    same code path main.py's predict_step uses for real inference -- NOT
-    the training loss) on an evenly-spaced subset of up to `max_samples`
-    validation examples, reconstructs each predicted trajectory with
-    utils.IntegrateCurvatureForPoints (identical math to main.py), and
-    compares it against openemma_dataset.py's cur_pos/cur_vel/fut_world
-    fields to get a REAL ADE in meters. See this file's module docstring
-    for why this exists as a separate check from run_validation()'s loss.
-
-    Deliberately processes one sample at a time (batch size 1), matching
-    main.py's own proven-working eval=True call pattern exactly, rather
-    than risking an untested batched eval=True path.
-    """
     model.eval()
     max_samples = max_samples if max_samples is not None else ADE_EVAL_SAMPLES
     n = min(max_samples, len(val_dataset))
     if n == 0:
         model.train()
         return None
-    # Evenly-spaced subset (not just the first N) so this isn't silently
-    # dominated by whichever scene happens to sort first in the dataset.
     idxs = np.linspace(0, len(val_dataset) - 1, num=n, dtype=int)
 
     ade1s_list, ade2s_list, ade3s_list = [], [], []
@@ -396,16 +271,16 @@ def run_validation_ade(epoch, max_samples=None):
         for idx in idxs:
             s = val_dataset[int(idx)]
             try:
-                input_ids, images = preprocess_batch({"image_path": [s["image_path"]], "raw_lang": [s["raw_lang"]]})
+                inputs = preprocess_batch({"image_path": [s["image_path"]], "raw_lang": [s["raw_lang"]]})
                 state = s["state"].unsqueeze(0).cuda()
-                pred = model(input_ids=input_ids, images=images, states=state, eval=True)
+                pred = model(**inputs, states=state, eval=True)
             except torch.OutOfMemoryError as e:
                 print(f"[val-ade] epoch {epoch} | OOM, SKIPPING one sample: {e}")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
 
-            pred = pred[0].cpu().numpy()   # (10, 2) -- [speed, curvature*100], same layout as training targets
+            pred = pred[0].cpu().numpy()
             pred_speeds = pred[:, 0]
             pred_curvatures = pred[:, 1] / 100
             cur_pos = s["cur_pos"].numpy()
@@ -414,7 +289,7 @@ def run_validation_ade(epoch, max_samples=None):
             initial_heading = atan2(cur_vel[1], cur_vel[0])
             pred_traj = IntegrateCurvatureForPoints(pred_curvatures, pred_speeds, cur_pos, initial_heading, DT_ADE)
 
-            err = np.linalg.norm(fut_world - pred_traj, axis=1)   # (10,) per-step displacement error, meters
+            err = np.linalg.norm(fut_world - pred_traj, axis=1)
             ade1s_list.append(float(np.mean(err[:2])))
             ade2s_list.append(float(np.mean(err[:4])))
             ade3s_list.append(float(np.mean(err[:6])))
@@ -424,10 +299,8 @@ def run_validation_ade(epoch, max_samples=None):
         return None
     mean_ade1s, mean_ade2s, mean_ade3s = float(np.mean(ade1s_list)), float(np.mean(ade2s_list)), float(np.mean(ade3s_list))
     return {
-        "ade1s": mean_ade1s,
-        "ade2s": mean_ade2s,
-        "ade3s": mean_ade3s,
-        "avgade": float(np.mean([mean_ade1s, mean_ade2s, mean_ade3s])),   # same convention as main.py's per-scene avgade
+        "ade1s": mean_ade1s, "ade2s": mean_ade2s, "ade3s": mean_ade3s,
+        "avgade": float(np.mean([mean_ade1s, mean_ade2s, mean_ade3s])),
         "n_samples": len(ade1s_list),
     }
 
@@ -438,71 +311,30 @@ for epoch in range(EPOCHS):
     for step, batch in enumerate(loader):
         frame_start = time.time()
 
-        input_ids, images = preprocess_batch(batch)
-        state = batch["state"].cuda()      # (B, 20)
-        action = batch["action"].cuda()    # (B, 10, 2) -- GT future trajectories (diffusion regression target)
-        is_pad = batch["is_pad"].cuda()    # (B, 10)
+        inputs = preprocess_batch(batch)
+        state = batch["state"].cuda()
+        action = batch["action"].cuda()
+        is_pad = batch["is_pad"].cuda()
 
-        # ADDED (OOM survivability across the WHOLE run, not just step 0->1):
-        # the step-0->step-1 crash was a ONE-TIME jump -- AdamW allocates
-        # exp_avg/exp_avg_sq once, on the first optimizer.step(), and that
-        # memory is reused in place forever after, it does not keep growing
-        # every step. So that specific mechanism cannot repeat later in
-        # training. But total memory per step is NOT perfectly flat for the
-        # rest of the run either: preprocess_batch() pads input_ids to the
-        # LONGEST prompt in each specific batch (dynamic padding), so a
-        # batch that happens to draw a longer raw_lang text needs more
-        # activation memory than average; over thousands of steps across 5
-        # epochs, plus ordinary CUDA allocator fragmentation (expandable_
-        # segments helps but doesn't guarantee zero), a rare step can still
-        # spike close to the ceiling this GPU is already running near. A
-        # crash on step 4000 of 5 would otherwise lose the rest of that
-        # epoch's progress. So: catch the OOM, free what we can, skip just
-        # that one micro-batch, and keep the run alive -- this is a safety
-        # net for rare spikes, not a fix for a batch size that's
-        # structurally too big (if EVERY step OOMs, skipping won't help).
         try:
-            out = model(input_ids=input_ids, images=images, states=state,
-                        actions=action, is_pad=is_pad)
+            out = model(**inputs, states=state, actions=action, is_pad=is_pad)
             loss = out["loss"] if isinstance(out, dict) else out.loss
 
-            # ADDED (loss=nan guard): if a NaN/Inf loss still slips through
-            # despite the curvature clip in utils.py (belt-and-suspenders --
-            # there could be other degenerate samples we haven't seen yet),
-            # NEVER call .backward()/optimizer.step() on it. AdamW's exp_avg /
-            # exp_avg_sq are *cumulative* running averages -- one NaN gradient
-            # poisons that state permanently, and every future update for that
-            # parameter is NaN forever after, even once the bad batch is long
-            # gone. Skipping the step (but not the frame-timing bookkeeping)
-            # costs one batch of training and keeps the run alive; the printed
-            # diagnostics show exactly which raw state/action values triggered
-            # it, in case the clip needs to be tightened further.
             loss_is_finite = torch.isfinite(loss)
             if not loss_is_finite:
                 print(f"epoch {epoch} step {step} | SKIPPED (loss={loss.item()}) | "
                       f"state min/max={state.min().item():.3f}/{state.max().item():.3f} | "
                       f"action min/max={action.min().item():.3f}/{action.max().item():.3f}")
                 optimizer.zero_grad()
-                # FIXED: this used to fall through to the s_loss/s_t
-                # bookkeeping below with a NaN/Inf loss.item(), which
-                # permanently poisoned the rest of this epoch's average
-                # (NaN + anything = NaN). Skip this step's bookkeeping too,
-                # exactly like the OOM branch already does.
                 continue
             else:
-                # CHANGED (OOM mitigation, gradient accumulation): normalize by
-                # GRAD_ACCUM_STEPS so the accumulated gradient over
-                # GRAD_ACCUM_STEPS micro-batches matches the scale a single
-                # batch_size=4 step would have produced -- this is what keeps
-                # the effective batch size (and the tuned learning rates) at 4
-                # even though each micro-batch here is only size 2.
                 (loss / GRAD_ACCUM_STEPS).backward()
                 if (step + 1) % GRAD_ACCUM_STEPS == 0:
                     optimizer.step()
                     optimizer.zero_grad()
         except torch.OutOfMemoryError as e:
             print(f"epoch {epoch} step {step} | OOM, SKIPPING this micro-batch "
-                  f"(batch_size={input_ids.shape[0]}, padded_seq_len={input_ids.shape[1]}): {e}")
+                  f"(batch_size={inputs['input_ids'].shape[0]}): {e}")
             optimizer.zero_grad(set_to_none=True)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -511,7 +343,7 @@ for epoch in range(EPOCHS):
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         step_time = time.time() - frame_start
-        batch_size = input_ids.shape[0]
+        batch_size = inputs["input_ids"].shape[0]
 
         global_frame_count += batch_size
         total_process_time += step_time
@@ -528,15 +360,10 @@ for epoch in range(EPOCHS):
 
     with open(filename, "r") as file:
         losses = json.load(file)
-
-    # Update the dictionary
-    losses[f"epoch-{epoch}"] = s_loss/s_t
-
-    # Write back the fresh dictionary
+    losses[f"epoch-{epoch}"] = s_loss / s_t
     with open(filename, "w") as file:
         json.dump(losses, file, indent=4)
 
-    # One held-out validation LOSS pass per epoch, saved the same way.
     val_avg = run_validation(epoch)
     print(f"epoch {epoch} | validation loss = {val_avg}")
     with open(val_filename, "r") as file:
@@ -545,10 +372,6 @@ for epoch in range(EPOCHS):
     with open(val_filename, "w") as file:
         json.dump(val_losses, file, indent=4)
 
-    # ADDED: real ADE (meters) on a bounded validation subset, every
-    # ADE_EVAL_EVERY epochs (plus always on the final epoch) -- see
-    # run_validation_ade's and this file's module docstrings for why this
-    # is tracked separately from the diffusion loss above.
     if (epoch % ADE_EVAL_EVERY == 0) or (epoch == EPOCHS - 1):
         ade_summary = run_validation_ade(epoch)
         print(f"epoch {epoch} | validation ADE (meters) = {ade_summary}")
@@ -558,7 +381,7 @@ for epoch in range(EPOCHS):
         with open(val_ade_filename, "w") as file:
             json.dump(val_ade, file, indent=4)
 
-    model.save_pretrained(f"openemma_tinyvla_epoch{epoch}")
+    model.save_pretrained(f"openemma_qwen_epoch{epoch}")
 
 print(f"Training done. Total frames processed: {global_frame_count}, "
       f"final running average frame-processing time: {total_process_time / max(global_frame_count, 1):.3f}s")
@@ -569,37 +392,21 @@ with open(filename, "r") as file:
     losses = json.load(file)
 with open(val_filename, "r") as file:
     val_losses = json.load(file)
-with open(val_ade_filename, "r") as file:   # ADDED
-    val_ade = json.load(file)   # ADDED
+with open(val_ade_filename, "r") as file:
+    val_ade = json.load(file)
 
 plt.figure(figsize=(12, 6))
-plt.plot(
-    list(losses.keys()), list(losses.values()), marker="o", linestyle="-", label="train"
-)
-# Overlay validation loss on the same axes, same x labels, so the two
-# curves are directly comparable at a glance.
-plt.plot(
-    list(val_losses.keys()), list(val_losses.values()), marker="s", linestyle="--", label="val"
-)
-
-# Add labels and title for readability
+plt.plot(list(losses.keys()), list(losses.values()), marker="o", linestyle="-", label="train")
+plt.plot(list(val_losses.keys()), list(val_losses.values()), marker="s", linestyle="--", label="val")
 plt.xlabel("Epoch")
 plt.ylabel("Loss Value")
-plt.title("Training vs. Validation Loss per Epoch")
-plt.xticks(rotation=45)  # Rotate epoch labels if they crowd together
+plt.title("OpenEMMA-Qwen: Training vs. Validation Loss per Epoch")
+plt.xticks(rotation=45)
 plt.legend()
 plt.grid(True)
-
-# 1. SAVE FIRST (with dpi=300 for high resolution)
-plt.savefig("ep_loss_graph.jpg", dpi=300, bbox_inches="tight")
-
-# 2. SHOW LAST
+plt.savefig("qwen_ep_loss_graph.jpg", dpi=300, bbox_inches="tight")
 plt.show()
 
-# ADDED: real validation ADE per epoch -- the metric that actually matters,
-# plotted separately since it's only recorded every ADE_EVAL_EVERY epochs
-# (see run_validation_ade's docstring) and lives on a different y-axis scale
-# (meters) than the diffusion loss above.
 ade_epochs = [k for k, v in val_ade.items() if v is not None]
 if ade_epochs:
     plt.figure(figsize=(12, 6))
@@ -609,11 +416,11 @@ if ade_epochs:
     plt.plot(ade_epochs, [val_ade[k]["avgade"] for k in ade_epochs], marker="s", linestyle="--", label="Avg ADE")
     plt.xlabel("Epoch")
     plt.ylabel("ADE (m)")
-    plt.title(f"Validation ADE per Epoch (n={ADE_EVAL_SAMPLES} sampled, every {ADE_EVAL_EVERY} epochs)")
+    plt.title(f"OpenEMMA-Qwen: Validation ADE per Epoch (n={ADE_EVAL_SAMPLES} sampled, every {ADE_EVAL_EVERY} epochs)")
     plt.xticks(rotation=45)
     plt.legend()
     plt.grid(True)
-    plt.savefig("val_ade_graph.jpg", dpi=300, bbox_inches="tight")
+    plt.savefig("qwen_val_ade_graph.jpg", dpi=300, bbox_inches="tight")
     plt.show()
 else:
-    print("No validation ADE was recorded (val set empty, or every attempt OOM'd) -- skipping the ADE plot.")
+    print("No validation ADE was recorded -- skipping the ADE plot.")
