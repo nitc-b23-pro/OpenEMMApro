@@ -44,15 +44,11 @@ DT = 0.5
 # train_openemma.py's PRETRAINED.
 BASE_PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
 
-# Caps the number of visual tokens Qwen2.5-VL turns each frame into
-# (pixels / 28^2, since each visual token covers a 28x28 patch after the
-# 2x2 patch merge). The default range (256..1280 tokens, i.e.
-# min_pixels=256*28*28..max_pixels=1280*28*28) is tuned for general
-# scene understanding; a single front-camera frame doesn't need that
-# much detail for trajectory prediction, and every extra visual token
-# lengthens the sequence the LoRA'd decoder has to backprop through.
+# Fixed (MIN==MAX) visual-token budget -- every frame becomes exactly the
+# same sequence length, matching train_openemma.py so inference sees what
+# the model was actually trained on, and keeping memory use predictable.
 MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 512 * 28 * 28
+MAX_PIXELS = 256 * 28 * 28
 
 
 def load_model_and_processor(base_pretrained=BASE_PRETRAINED, trained_checkpoint_path=None):

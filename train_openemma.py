@@ -46,11 +46,15 @@ DT_ADE = 0.5
 ADE_EVAL_EVERY = 5
 ADE_EVAL_SAMPLES = 64
 
-# See main.py's MIN_PIXELS/MAX_PIXELS comment: bounds how many visual
-# tokens each frame expands to, which bounds the decoder's sequence
-# length (and therefore its backward-pass memory).
+# Fixed (not just capped) visual-token budget: MIN==MAX means every frame
+# becomes exactly the same sequence length, so memory use no longer varies
+# frame to frame. With a range, GPU memory was staying pinned within a few
+# dozen MB of the limit for most frames, and the occasional frame needing
+# more tokens than usual was enough to OOM. Keep this in sync with
+# main.py's MIN_PIXELS/MAX_PIXELS so inference sees the same token budget
+# the model was trained on.
 MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 512 * 28 * 28
+MAX_PIXELS = 256 * 28 * 28
 
 model = build_openemma(PRETRAINED).cuda()
 processor = AutoProcessor.from_pretrained(PRETRAINED, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
@@ -218,10 +222,20 @@ for epoch in range(EPOCHS):
             loss = out["loss"]
             if not torch.isfinite(loss):
                 print(f"epoch {epoch} step {step} | SKIPPED (loss={loss.item()})")
-                optimizer.zero_grad()
+                # Don't touch the optimizer's grads here: backward() was
+                # never called for this micro-batch, so there's nothing of
+                # this step's to clear, and a blanket zero_grad() would
+                # wipe out gradients legitimately accumulated from earlier
+                # micro-steps in this same accumulation window.
                 continue
             (loss / GRAD_ACCUM_STEPS).backward()
             if (step + 1) % GRAD_ACCUM_STEPS == 0:
+                # Clip before stepping -- unclipped gradients are the
+                # likely source of the occasional NaN loss, and a runaway
+                # update also risks leaving weights (and the next
+                # forward's activations) at a scale that's more likely to
+                # blow the memory budget too.
+                torch.nn.utils.clip_grad_norm_(lora_params + head_params, max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
         except torch.OutOfMemoryError as e:
