@@ -1,20 +1,12 @@
 """
-eval_train_vs_test_qwen.py
-Same train-scenes-vs-unseen-scenes ADE comparison as eval_train_vs_test.py,
-against a Qwen2.5-VL-3B-Instruct checkpoint (main_qwen.py) instead of the
-LLaVA-Pythia one. Branch: kaggle-openvlm.
-
-Only real difference from eval_train_vs_test.py: imports from main_qwen
-instead of main, and load_model_and_processors()/run_inference_on_scenes()
-here take (model, processor) instead of (model, tokenizer, image_processor)
--- see main_qwen.py's module docstring for why. Everything else (scene-
-split recovery, scene sampling, ADE summarization, the comparison plot/
-JSON) is identical and copied unchanged.
+eval_train_vs_test.py
+Compares ADE on scenes the model trained on (seen) vs. scenes it never
+saw (unseen), to check for memorization/overfitting.
 
 Usage
 -----
-    python eval_train_vs_test_qwen.py \\
-        --epoch /kaggle/working/OpenEMMApro/openemma_qwen_epoch19/ \\
+    python eval_train_vs_test.py \\
+        --epoch /kaggle/working/OpenEMMApro/openemma_epoch19/ \\
         --train-dataroot /kaggle/working/nuscenes_test_root/ --train-version v1.0-test \\
         --test-dataroot datasets/NuScenes --test-version v1.0-mini \\
         --n-train-scenes 5 --n-test-scenes 5
@@ -25,14 +17,14 @@ import os
 import random
 from datetime import datetime
 
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 from nuscenes import NuScenes
 
-from main import load_model_and_processors, run_inference_on_scenes, BASE_PRETRAINED, TTL_LEN
+from main import load_model_and_processor, run_inference_on_scenes, BASE_PRETRAINED, TTL_LEN
 
 VAL_FRACTION = 0.1
-SPLIT_SEED = 42
+SPLIT_SEED = 42   # must match train_openemma.py
 
 
 def recover_train_scene_names(dataroot, version):
@@ -53,8 +45,7 @@ def pick_scenes(nusc, allowed_names, n, seed=SPLIT_SEED):
         tok, last = s["first_sample_token"], s["last_sample_token"]
         n_frames = 1
         while tok != last:
-            sample = nusc.get("sample", tok)
-            tok = sample["next"]
+            tok = nusc.get("sample", tok)["next"]
             n_frames += 1
         if n_frames >= TTL_LEN:
             usable.append(s)
@@ -89,7 +80,7 @@ def plot_comparison(train_summary, test_summary, output_path):
     plt.bar(x + width / 2, test_vals, width, label=f"Test scenes (unseen, n={test_summary['n_scenes']})")
     plt.xticks(x, labels)
     plt.ylabel("ADE (m)")
-    plt.title("OpenEMMA-Qwen: ADE on training scenes (seen) vs. test scenes (unseen)")
+    plt.title("OpenEMMA: ADE on training scenes (seen) vs. test scenes (unseen)")
     plt.legend()
     plt.grid(True, axis="y")
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
@@ -100,7 +91,7 @@ def plot_comparison(train_summary, test_summary, output_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-path", type=str, default="qwen")
-    parser.add_argument("--epoch", type=str, required=True, help="trained checkpoint dir, e.g. openemma_qwen_epoch19/")
+    parser.add_argument("--epoch", type=str, required=True)
     parser.add_argument("--train-dataroot", type=str, default="/kaggle/working/nuscenes_test_root/")
     parser.add_argument("--train-version", type=str, default="v1.0-test")
     parser.add_argument("--test-dataroot", type=str, default="datasets/NuScenes")
@@ -108,9 +99,6 @@ def main():
     parser.add_argument("--n-train-scenes", type=int, default=5)
     parser.add_argument("--n-test-scenes", type=int, default=5)
     parser.add_argument("--plot", type=bool, default=True)
-    parser.add_argument("--use-intent", dest="use_intent", action="store_true", default=True)
-    parser.add_argument("--no-intent", dest="use_intent", action="store_false")
-    parser.add_argument("--lookahead-offset", type=int, default=TTL_LEN)
     parser.add_argument("--output-dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -122,22 +110,19 @@ def main():
     os.makedirs(test_dir, exist_ok=True)
 
     print(f"Loading model from checkpoint: {args.epoch}")
-    model, processor = load_model_and_processors(BASE_PRETRAINED, args.epoch)
+    model, processor = load_model_and_processor(BASE_PRETRAINED, args.epoch)
 
-    print(f"Recovering train/val scene split for {args.train_dataroot} ({args.train_version}) "
-          f"using VAL_FRACTION={VAL_FRACTION}, SPLIT_SEED={SPLIT_SEED} (must match train_openemma_qwen.py)...")
+    print(f"Recovering train/val scene split for {args.train_dataroot} ({args.train_version})...")
     train_nusc, train_scene_names, val_scene_names = recover_train_scene_names(args.train_dataroot, args.train_version)
     print(f"{len(train_scene_names)} scenes were in TRAIN, {len(val_scene_names)} held out as VAL.")
 
     train_eval_scenes = pick_scenes(train_nusc, train_scene_names, args.n_train_scenes)
-    print(f"Evaluating on {len(train_eval_scenes)} TRAIN-split scene(s): "
-          f"{[s['name'] for s in train_eval_scenes]}")
+    print(f"Evaluating on {len(train_eval_scenes)} TRAIN-split scene(s): {[s['name'] for s in train_eval_scenes]}")
 
     print(f"Loading test nuScenes: {args.test_dataroot} ({args.test_version})")
     test_nusc = NuScenes(version=args.test_version, dataroot=args.test_dataroot)
     test_eval_scenes = pick_scenes(test_nusc, None, args.n_test_scenes)
-    print(f"Evaluating on {len(test_eval_scenes)} test scene(s): "
-          f"{[s['name'] for s in test_eval_scenes]}")
+    print(f"Evaluating on {len(test_eval_scenes)} test scene(s): {[s['name'] for s in test_eval_scenes]}")
 
     print("\n=== Running inference on TRAIN-split (seen) scenes ===")
     train_results = run_inference_on_scenes(train_nusc, train_eval_scenes, model, processor, train_dir, args)
@@ -150,7 +135,6 @@ def main():
 
     comparison = {
         "checkpoint": args.epoch,
-        "use_intent": args.use_intent,
         "train": {"dataroot": args.train_dataroot, "version": args.train_version, "summary": train_summary, "per_scene": train_results},
         "test": {"dataroot": args.test_dataroot, "version": args.test_version, "summary": test_summary, "per_scene": test_results},
     }

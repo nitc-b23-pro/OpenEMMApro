@@ -1,8 +1,8 @@
 """
 plot_losses.py
 Standalone re-plot of training-vs-validation loss per epoch, from the two
-JSON files train_openemma_tinyvla.py already writes
-(lp_epoch_loss.json / val_epoch_losses.json). train_openemma_tinyvla.py
+JSON files train_openemma.py already writes
+(epoch_loss.json / val_epoch_losses.json). train_openemma.py
 already produces this exact plot itself at the end of a run -- this script
 exists so you can regenerate it WITHOUT re-running training, e.g. if the
 Kaggle session ended before reaching the final plotting cell, or you just
@@ -12,7 +12,7 @@ side effects.
 Usage
 -----
     python plot_losses.py
-    python plot_losses.py --train-losses lp_epoch_loss.json --val-losses val_epoch_losses.json --output ep_loss_graph.jpg
+    python plot_losses.py --train-losses epoch_loss.json --val-losses val_epoch_losses.json --output ep_loss_graph.jpg
 """
 import argparse
 import json
@@ -42,7 +42,7 @@ def plot_losses(train_losses, val_losses, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--train-losses", type=str, default="lp_epoch_loss.json")
+    parser.add_argument("--train-losses", type=str, default="epoch_loss.json")
     parser.add_argument("--val-losses", type=str, default="val_epoch_losses.json")
     parser.add_argument("--output", type=str, default="ep_loss_graph.jpg")
     args = parser.parse_args()
