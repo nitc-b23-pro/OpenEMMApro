@@ -34,9 +34,15 @@ FUT_LEN = 10
 TTL_LEN = OBS_LEN + FUT_LEN
 DT = 0.5
 
-# EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
-# keep in sync with train_openemma.py's PRETRAINED.
-BASE_PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
+# EDIT ME (or set the OPENEMMA_QWEN_PATH env var): local directory holding
+# Qwen2.5-VL-3B-Instruct's weights/config/processor files -- must be a real
+# path on disk, not a HF Hub repo id. If your Kaggle input's
+# preprocessor_config.json isn't recognized by the installed transformers
+# version, fix it in a working copy (e.g. symlink the input dir into
+# /kaggle/working/ and patch image_processor_type/processor_class there)
+# and point this at that copy -- not the raw input. Keep in sync with
+# train_openemma.py's PRETRAINED.
+BASE_PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
 
 # Caps the number of visual tokens Qwen2.5-VL turns each frame into
 # (pixels / 28^2, since each visual token covers a 28x28 patch after the

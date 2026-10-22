@@ -25,9 +25,15 @@ from build_model import build_openemma
 from openemma_dataset import OpenEMMADataset
 from utils import IntegrateCurvatureForPoints
 
-# EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
-# keep in sync with main.py's BASE_PRETRAINED.
-PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
+# EDIT ME (or set the OPENEMMA_QWEN_PATH env var): local directory holding
+# Qwen2.5-VL-3B-Instruct's weights/config/processor files -- must be a real
+# path on disk, not a HF Hub repo id. If your Kaggle input's
+# preprocessor_config.json isn't recognized by the installed transformers
+# version, fix it in a working copy (e.g. symlink the input dir into
+# /kaggle/working/ and patch image_processor_type/processor_class there)
+# and point this at that copy -- not the raw input. Keep in sync with
+# main.py's BASE_PRETRAINED.
+PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
 DATAROOT = "/kaggle/working/nuscenes_test_root/"
 VERSION = "v1.0-test"
 
