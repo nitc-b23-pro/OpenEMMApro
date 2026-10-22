@@ -36,7 +36,7 @@ DT = 0.5
 
 # EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
 # keep in sync with train_openemma.py's PRETRAINED.
-BASE_PRETRAINED = "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/"
+BASE_PRETRAINED = "/kaggle/working/qwen2.5-vl-3b-fixed"
 
 
 def load_model_and_processor(base_pretrained=BASE_PRETRAINED, trained_checkpoint_path=None):

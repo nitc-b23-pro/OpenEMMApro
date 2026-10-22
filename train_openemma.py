@@ -27,7 +27,7 @@ from utils import IntegrateCurvatureForPoints
 
 # EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
 # keep in sync with main.py's BASE_PRETRAINED.
-PRETRAINED = "/kaggle/input/models/qwen-lm/qwen2.5-vl/transformers/3b-instruct/2/"
+PRETRAINED = "/kaggle/working/qwen2.5-vl-3b-fixed"
 DATAROOT = "/kaggle/working/nuscenes_test_root/"
 VERSION = "v1.0-test"
 
