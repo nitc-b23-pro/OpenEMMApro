@@ -27,21 +27,27 @@ from utils import IntegrateCurvatureForPoints
 
 # EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
 # keep in sync with main.py's BASE_PRETRAINED.
-PRETRAINED = "/kaggle/working/qwen2.5-vl-3b-fixed"
+PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
 DATAROOT = "/kaggle/working/nuscenes_test_root/"
 VERSION = "v1.0-test"
 
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
-BATCH_SIZE = 2
-GRAD_ACCUM_STEPS = 2
+BATCH_SIZE = 1
+GRAD_ACCUM_STEPS = 4   # effective batch size stays 4, but peak per-step memory is halved
 EPOCHS = 40
 DT_ADE = 0.5
 ADE_EVAL_EVERY = 5
 ADE_EVAL_SAMPLES = 64
 
+# See main.py's MIN_PIXELS/MAX_PIXELS comment: bounds how many visual
+# tokens each frame expands to, which bounds the decoder's sequence
+# length (and therefore its backward-pass memory).
+MIN_PIXELS = 256 * 28 * 28
+MAX_PIXELS = 512 * 28 * 28
+
 model = build_openemma(PRETRAINED).cuda()
-processor = AutoProcessor.from_pretrained(PRETRAINED)
+processor = AutoProcessor.from_pretrained(PRETRAINED, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 

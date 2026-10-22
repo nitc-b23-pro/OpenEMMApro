@@ -36,12 +36,22 @@ DT = 0.5
 
 # EDIT ME: wherever your Kaggle input mounts Qwen2.5-VL-3B-Instruct --
 # keep in sync with train_openemma.py's PRETRAINED.
-BASE_PRETRAINED = "/kaggle/working/qwen2.5-vl-3b-fixed"
+BASE_PRETRAINED = "/kaggle/input/qwen2.5-vl-3b-instruct/transformers/default/1/"
+
+# Caps the number of visual tokens Qwen2.5-VL turns each frame into
+# (pixels / 28^2, since each visual token covers a 28x28 patch after the
+# 2x2 patch merge). The default range (256..1280 tokens, i.e.
+# min_pixels=256*28*28..max_pixels=1280*28*28) is tuned for general
+# scene understanding; a single front-camera frame doesn't need that
+# much detail for trajectory prediction, and every extra visual token
+# lengthens the sequence the LoRA'd decoder has to backprop through.
+MIN_PIXELS = 256 * 28 * 28
+MAX_PIXELS = 512 * 28 * 28
 
 
 def load_model_and_processor(base_pretrained=BASE_PRETRAINED, trained_checkpoint_path=None):
     model = build_openemma(base_pretrained, trained_checkpoint_path=trained_checkpoint_path).cuda().eval()
-    processor = AutoProcessor.from_pretrained(base_pretrained)
+    processor = AutoProcessor.from_pretrained(base_pretrained, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
     return model, processor
 
 
