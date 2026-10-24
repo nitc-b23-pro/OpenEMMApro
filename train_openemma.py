@@ -39,9 +39,9 @@ VERSION = "v1.0-test"
 
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
-BATCH_SIZE = 1
+BATCH_SIZE = 2
 GRAD_ACCUM_STEPS = 4   # effective batch size stays 4, but peak per-step memory is halved
-EPOCHS = 40
+EPOCHS = 20
 DT_ADE = 0.5
 ADE_EVAL_EVERY = 5
 ADE_EVAL_SAMPLES = 64
