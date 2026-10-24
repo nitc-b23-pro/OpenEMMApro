@@ -40,6 +40,20 @@ ACTION_DIM = 2    # [speed, curvature] per predicted step
 STATE_DIM = 20    # 10 history steps x 2 numbers, flattened
 CHUNK_SIZE = 10   # predicted future steps
 
+# `states` is a flattened (OBS_LEN, 2) history of [speed, curvature*100],
+# oldest first (see openemma_dataset.py's `obs`), so its last 2 entries are
+# the most recently observed [speed, curvature*100] -- exactly the same
+# representation as one row of the predicted `actions` (see `fut` in the
+# same file). That makes "repeat/extrapolate the last observed step" an
+# almost-free shortcut for the diffusion head: real driving is mostly
+# steady, so recent speed/curvature alone already explains most frames,
+# starving the VLM-conditioning pathway of gradient signal and leaving the
+# model unable to anticipate the scenes that actually deviate from
+# constant motion (turns, stops, reacting to other agents) -- regardless
+# of which backbone sits upstream. See STATE_DROPOUT_PROB and
+# OpenEMMAPolicy.forward()'s residual-target reparameterization below.
+STATE_DROPOUT_PROB = float(os.environ.get("OPENEMMA_STATE_DROPOUT", "0.3"))
+
 
 def find_linear_names(model):
     """
@@ -116,15 +130,38 @@ class OpenEMMAPolicy(nn.Module):
                 states=None, actions=None, eval=False, **_unused):
         hidden_states = self._hidden_states(input_ids, attention_mask, pixel_values, image_grid_thw).float()
 
+        # The last observed [speed, curvature*100] (always the real one,
+        # even when state dropout zeroes the *conditioning* copy below) --
+        # the no-op "keep doing what you were doing" baseline that the
+        # diffusion head should get for free rather than having to learn.
+        baseline = states[:, -self.action_dim:].unsqueeze(1)
+
+        cond_states = states
+        if self.training and STATE_DROPOUT_PROB > 0:
+            # Classifier-free-guidance-style regularization: on a random
+            # fraction of training batches, hide the history conditioning
+            # entirely, so the head cannot always lean on it and has to
+            # pull genuinely useful signal from the VLM pathway on those
+            # batches too.
+            keep = (torch.rand(states.size(0), 1, device=states.device) >= STATE_DROPOUT_PROB).to(states.dtype)
+            cond_states = states * keep
+
         if not eval:
             actions = actions[:, :self.num_queries]
-            noise = torch.randn_like(actions)
+            # Diffuse the residual from the constant-motion baseline, not
+            # the raw future -- this is the fix for the shortcut above: the
+            # "keep going the way you were going" component is now free
+            # (plain subtraction), so the loss -- and therefore gradient --
+            # is dominated by the part that genuinely requires the image:
+            # where this frame's future actually deviates from that.
+            residual_actions = actions - baseline
+            noise = torch.randn_like(residual_actions)
             timesteps = torch.randint(
                 0, self.noise_scheduler.config.num_train_timesteps, (actions.size(0),), device=actions.device
             ).long()
-            noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps).to(actions.dtype)
+            noisy_actions = self.noise_scheduler.add_noise(residual_actions, noise, timesteps).to(residual_actions.dtype)
 
-            noise_pred = self.embed_out(noisy_actions, timesteps, global_cond=hidden_states, states=states)
+            noise_pred = self.embed_out(noisy_actions, timesteps, global_cond=hidden_states, states=cond_states)
             loss = torch.nn.functional.mse_loss(noise_pred, noise)
             return {"loss": loss}
 
@@ -133,9 +170,12 @@ class OpenEMMAPolicy(nn.Module):
         )
         self.noise_scheduler.set_timesteps(self.num_inference_timesteps)
         for k in self.noise_scheduler.timesteps:
-            noise_pred = self.embed_out(naction, k, global_cond=hidden_states, states=states)
+            noise_pred = self.embed_out(naction, k, global_cond=hidden_states, states=cond_states)
             naction = self.noise_scheduler.step(model_output=noise_pred, timestep=k, sample=naction).prev_sample
-        return naction
+        # naction is the predicted residual from the baseline -- add it
+        # back so callers keep seeing absolute [speed, curvature*100], same
+        # as before this change.
+        return naction + baseline
 
     def save_pretrained(self, path):
         os.makedirs(path, exist_ok=True)
