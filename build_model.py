@@ -5,6 +5,7 @@ OpenEMMA local trajectory prediction. The head lives outside the LoRA-
 wrapped backbone as a sibling module (OpenEMMAPolicy), so its weights are
 saved/loaded separately from the backbone's LoRA adapter.
 """
+import json
 import os
 
 import huggingface_hub
@@ -53,6 +54,17 @@ CHUNK_SIZE = 10   # predicted future steps
 # of which backbone sits upstream. See STATE_DROPOUT_PROB and
 # OpenEMMAPolicy.forward()'s residual-target reparameterization below.
 STATE_DROPOUT_PROB = float(os.environ.get("OPENEMMA_STATE_DROPOUT", "0.3"))
+
+# Bumped whenever OpenEMMAPolicy.forward()'s target formulation changes in a
+# way that makes old and new checkpoints incompatible for evaluation. A
+# checkpoint saved under one version loaded by code at a different version
+# will still *run* (the tensor shapes haven't changed) but will silently
+# produce meaningless numbers, because the diffusion head would have been
+# trained to predict a different quantity than the one the current eval code
+# assumes it predicts. "residual_v1" = the head predicts actions - baseline
+# (see forward()), not raw actions. Bump this and update the check in
+# build_openemma() if that ever changes again.
+HEAD_FORMAT_VERSION = "residual_v1"
 
 
 def find_linear_names(model):
@@ -181,6 +193,11 @@ class OpenEMMAPolicy(nn.Module):
         os.makedirs(path, exist_ok=True)
         self.backbone.save_pretrained(path)
         torch.save(self.embed_out.state_dict(), os.path.join(path, "diffusion_head.pt"))
+        # Record which target formulation this head was trained under, so a
+        # future load against mismatched code can warn instead of silently
+        # producing meaningless numbers (see HEAD_FORMAT_VERSION above).
+        with open(os.path.join(path, "head_meta.json"), "w") as f:
+            json.dump({"format_version": HEAD_FORMAT_VERSION, "state_dropout_prob": STATE_DROPOUT_PROB}, f, indent=2)
 
 
 def _load_backbone(pretrained_path):
@@ -239,4 +256,40 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
     head_state = torch.load(os.path.join(trained_checkpoint_path, "diffusion_head.pt"), map_location="cpu")
     model.embed_out.load_state_dict(head_state)
     model.embed_out = model.embed_out.float()
+    _check_head_format(trained_checkpoint_path)
     return model
+
+
+def _check_head_format(trained_checkpoint_path):
+    """
+    Loud (non-fatal) warning if this checkpoint's diffusion head was saved
+    under a different target formulation than the one forward() currently
+    implements. Without this, loading an old checkpoint (saved before
+    HEAD_FORMAT_VERSION existed, or under an earlier version) against the
+    current eval code runs fine but produces numbers that aren't meaningful:
+    e.g. a head trained to predict raw actions, evaluated by code that now
+    adds a baseline back on top of its output, double-counts the baseline.
+    """
+    meta_path = os.path.join(trained_checkpoint_path, "head_meta.json")
+    banner = "!" * 78
+    if not os.path.exists(meta_path):
+        print(banner)
+        print(f"WARNING: {trained_checkpoint_path} has no head_meta.json.")
+        print(f"This checkpoint predates format tracking (current format: {HEAD_FORMAT_VERSION!r}).")
+        print("If it was trained before the residual-target fix, forward()'s eval path")
+        print("(naction + baseline) will NOT match what this head was trained to predict,")
+        print("and ADE numbers from it are not meaningful -- train a fresh checkpoint on")
+        print("the current code before trusting/comparing eval results.")
+        print(banner)
+        return
+    with open(meta_path) as f:
+        meta = json.load(f)
+    saved_version = meta.get("format_version")
+    if saved_version != HEAD_FORMAT_VERSION:
+        print(banner)
+        print(f"WARNING: {trained_checkpoint_path} was saved with format_version={saved_version!r}, "
+              f"but this code expects {HEAD_FORMAT_VERSION!r}.")
+        print("Evaluating this checkpoint with the current code will produce numbers that")
+        print("are not meaningful and should not be compared against results from either")
+        print("version -- train a fresh checkpoint on the current code first.")
+        print(banner)
