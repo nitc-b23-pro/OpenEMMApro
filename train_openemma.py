@@ -21,7 +21,7 @@ from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader, Subset
 from transformers import AutoProcessor
 
-from build_model import build_openemma
+from build_model import build_openemma, compute_action_stats
 from openemma_dataset import OpenEMMADataset
 from utils import IntegrateCurvatureForPoints
 
@@ -39,9 +39,9 @@ VERSION = "v1.0-test"
 
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
-BATCH_SIZE = 2
+BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 4   # effective batch size stays 4, but peak per-step memory is halved
-EPOCHS = 20
+EPOCHS = 40
 DT_ADE = 0.5
 ADE_EVAL_EVERY = 5
 ADE_EVAL_SAMPLES = 64
@@ -62,6 +62,21 @@ model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 
 dataset = OpenEMMADataset(dataroot=DATAROOT, version=VERSION)
+
+# Diffusion sampling (build_model.py's DDIMScheduler) clamps every denoised
+# sample to [-1, 1] -- a standard assumption that the data being diffused is
+# already normalized to roughly that range. `state`/`action` here are raw
+# physical units ([speed in m/s, curvature*100]), nowhere near that scale, so
+# without this the model's own forward() refuses to run (see
+# OpenEMMAPolicy._stats_set). Must be computed before the scene split below
+# only in the sense that it needs `dataset`, not the split itself -- using
+# the full dataset here (not just the train split) is fine since these are
+# just normalization bounds, not something the model can overfit to.
+action_low, action_high = compute_action_stats(dataset)
+model.set_action_stats(action_low, action_high)
+print(f"Action/state normalization bounds (1st/99th percentile): "
+      f"speed=[{action_low[0]:.3f}, {action_high[0]:.3f}] m/s, "
+      f"curvature*100=[{action_low[1]:.3f}, {action_high[1]:.3f}]")
 
 scene_names = sorted({s["scene"] for s in dataset.samples})
 rng = random.Random(SPLIT_SEED)
