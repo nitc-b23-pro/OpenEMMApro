@@ -34,8 +34,11 @@ from utils import IntegrateCurvatureForPoints
 # and point this at that copy -- not the raw input. Keep in sync with
 # main.py's BASE_PRETRAINED.
 PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
-DATAROOT = "/kaggle/working/nuscenes_test_root/"
-VERSION = "v1.0-test"
+# Also overridable via env vars (see config/local.env.example /
+# docs/LOCAL_SETUP.md) -- defaults unchanged so the Kaggle notebook,
+# which never sets these, keeps working exactly as before.
+DATAROOT = os.environ.get("OPENEMMA_DATAROOT", "/kaggle/working/nuscenes_test_root/")
+VERSION = os.environ.get("OPENEMMA_VERSION", "v1.0-test")
 
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42

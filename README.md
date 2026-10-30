@@ -67,6 +67,18 @@ pip install torch torchvision diffusers transformers peft nuscenes-devkit opencv
 
 Also needs the vendored `llava-pythia/` package (TinyVLA's LLaVA‑Pythia implementation, with local patches for current-`transformers` compatibility) and `openemma/YOLO3D/` (only required if running with visualization overlays). Point `BASE_PRETRAINED` / `PRETRAINED` (top of `main.py` / `train_openemma_tinyvla.py`) at your local LLaVA‑Pythia checkpoint directory.
 
+## Local GPU training (Linux, one-click)
+
+This repo is actively developed on Kaggle (see `openemma.ipynb`), but the current Qwen2.5-VL-3B-Instruct + diffusion-head pipeline (`train_openemma.py`, `build_model.py`) can also be set up and trained on your own Linux GPU machine with a conda environment and a couple of scripts -- no Kaggle-specific paths or manual pip ordering required. See **[docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md)** for the full walkthrough; short version:
+
+```bash
+./setup_local.sh                                   # conda env + deps
+python scripts/prepare_nuscenes.py --kaggle-dataset aadimator/nuscenes-test
+python scripts/download_qwen_weights.py
+# edit config/local.env with the paths the two scripts above printed
+./train_local.sh
+```
+
 ## Usage
 
 **Generate route-intent cache** (optional — `--no-intent` skips this and drops the intent line from the prompt):

@@ -1,0 +1,56 @@
+# environment.yml
+# Conda environment for training OpenEMMApro locally. Consolidates the
+# Kaggle notebook's requirements.txt + ad-hoc pip cells into one spec.
+#
+# PyTorch is deliberately NOT pinned here: the right CUDA build depends on
+# your GPU driver, not on this project. setup_local.sh installs it
+# separately with `--index-url https://download.pytorch.org/whl/$CUDA_TAG`
+# right after this env is created -- see config/local.env.example for
+# CUDA_TAG. nuscenes-devkit and the vendored policy_heads package are also
+# installed by setup_local.sh in their own steps, not listed below -- see
+# docs/LOCAL_SETUP.md ("Why two install stages") for why.
+name: openemma
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # --- Core OpenEMMA deps (requirements.txt) -----------------------
+      - accelerate
+      - matplotlib
+      - opencv-python==4.11.0.86
+      - Pillow
+      - PyYAML
+      - requests
+      - tqdm
+      - gdown
+      - flask
+      - Werkzeug
+      - transformers==4.51.3
+      - ultralytics
+      - qwen_vl_utils
+      - pyquaternion
+      - pandas
+      - seaborn
+      - thop
+
+      # --- Diffusion policy head (policy_heads / Tiny-VLA) -------------
+      - peft==0.11.1
+      - diffusers==0.27.2
+      - einops
+      - einops-exts
+      - bitsandbytes>=0.43
+
+      # --- nuscenes-devkit's OWN deps (it is installed --no-deps, but
+      #     these are the parts of its dependency set this project
+      #     actually needs at import time) ---------------------------
+      - cachetools
+      - descartes
+      - fire
+      - shapely
+
+      # --- Downloading/assembling weights + dataset (scripts/*.py) -----
+      - huggingface_hub
+      - kaggle
