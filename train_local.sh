@@ -23,9 +23,13 @@ else
   exit 1
 fi
 
+# shellcheck disable=SC1091
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate "$ENV_NAME"
+
 echo "OPENEMMA_QWEN_PATH=$OPENEMMA_QWEN_PATH"
 echo "OPENEMMA_DATAROOT=$OPENEMMA_DATAROOT"
 echo "OPENEMMA_VERSION=$OPENEMMA_VERSION"
 echo
 
-conda run -n "$ENV_NAME" --no-capture-output python train_openemma.py "$@"
+python train_openemma.py "$@"

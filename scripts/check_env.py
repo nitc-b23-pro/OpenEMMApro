@@ -17,6 +17,11 @@ REQUIRED = [
     "torch", "torchvision", "transformers", "accelerate", "peft",
     "diffusers", "einops", "bitsandbytes", "nuscenes", "cv2",
     "PIL", "qwen_vl_utils", "pyquaternion", "huggingface_hub",
+    # nuscenes-devkit's own runtime deps (installed --no-deps, so these
+    # have to be satisfied by environment.yml directly -- listed here too
+    # so a gap shows up immediately instead of as a buried ImportError
+    # the first time something inside nuscenes-devkit needs one of them).
+    "numpy", "sklearn", "scipy", "shapely", "pycocotools",
 ]
 
 

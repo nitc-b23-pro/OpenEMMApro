@@ -8,7 +8,11 @@
 # right after this env is created -- see config/local.env.example for
 # CUDA_TAG. nuscenes-devkit and the vendored policy_heads package are also
 # installed by setup_local.sh in their own steps, not listed below -- see
-# docs/LOCAL_SETUP.md ("Why two install stages") for why.
+# docs/LOCAL_SETUP.md ("Why two install stages") for why. numpy/scikit-learn/
+# scipy/parameterized/pycocotools/Shapely below are nuscenes-devkit's OWN
+# declared dependencies (it's installed --no-deps, so they have to be
+# satisfied here instead) -- see docs/LOCAL_SETUP.md's troubleshooting
+# section for what broke the first time this list didn't include them.
 name: openemma
 channels:
   - conda-forge
@@ -20,7 +24,12 @@ dependencies:
       # --- Core OpenEMMA deps (requirements.txt) -----------------------
       - accelerate
       - matplotlib
-      - opencv-python==4.11.0.86
+      # opencv-python-headless, not opencv-python: this project never
+      # opens a GUI window (cv2 calls here are circle/fillPoly/imwrite/
+      # VideoWriter only), and -headless avoids needing libGL.so.1 /
+      # other X11 shared libraries that a minimal/headless Linux training
+      # box often doesn't have installed.
+      - opencv-python-headless==4.11.0.86
       - Pillow
       - PyYAML
       - requests
@@ -42,15 +51,29 @@ dependencies:
       - einops
       - einops-exts
       - bitsandbytes>=0.43
+      # diffusers==0.27.2 imports huggingface_hub.cached_download, which
+      # huggingface_hub removed in 0.26.0 -- pinning below 0.26 keeps it
+      # importable. (huggingface_hub's own PyPI metadata for diffusers
+      # 0.27.2 only declares >=0.20.2 with no upper bound, so pip alone
+      # won't stop you from getting a too-new one here.)
+      - huggingface_hub==0.25.2
 
-      # --- nuscenes-devkit's OWN deps (it is installed --no-deps, but
-      #     these are the parts of its dependency set this project
-      #     actually needs at import time) ---------------------------
+      # --- nuscenes-devkit's OWN deps (it is installed --no-deps in
+      #     setup_local.sh, so its real dependency list has to be
+      #     satisfied here instead -- taken directly from its PyPI
+      #     metadata) -----------------------------------------------
       - cachetools
       - descartes
       - fire
-      - shapely
+      - scikit-learn
+      - scipy
+      - parameterized
+      - pycocotools>=2.0.1
+      - Shapely~=2.0.3
+      - numpy<2.0.0,>=1.22.0
 
       # --- Downloading/assembling weights + dataset (scripts/*.py) -----
-      - huggingface_hub
+      # (huggingface_hub itself is already pinned above, for diffusers'
+      # sake -- snapshot_download() has existed since well before 0.25.2,
+      # so scripts/download_qwen_weights.py doesn't need anything newer.)
       - kaggle

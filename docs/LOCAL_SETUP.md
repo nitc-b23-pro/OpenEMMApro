@@ -162,3 +162,38 @@ OPENEMMA_CONDA_ENV=myenv ./train_local.sh
 - **`NuScenes()` raises an `AssertionError` about a missing map mask** --
   re-run `scripts/prepare_nuscenes.py` with the same arguments; the
   map-mask patch step runs every time and is idempotent.
+- **`[FAIL] diffusers   cannot import name 'cached_download' from 'huggingface_hub'`** --
+  `diffusers==0.27.2` imports a function Hugging Face removed from
+  `huggingface_hub` in 0.26.0, and `diffusers`' own PyPI metadata doesn't
+  declare an upper bound that would stop pip from installing a too-new
+  one. `environment.yml` pins `huggingface_hub==0.25.2` to fix this --
+  if you still see it, your env predates that pin: `conda activate
+  openemma && pip install "huggingface_hub==0.25.2"`.
+- **`[FAIL] nuscenes   No module named 'sklearn'`** (or `scipy`, `shapely`,
+  `pycocotools`) -- `nuscenes-devkit` is installed with `--no-deps` (see
+  "Why two install stages" above), so its real runtime dependencies have
+  to be satisfied by `environment.yml` directly; they're all listed there
+  now. If you still see this, your env predates that fix: `conda activate
+  openemma && pip install scikit-learn scipy "Shapely~=2.0.3" "pycocotools>=2.0.1" "numpy<2.0.0,>=1.22.0"`.
+- **`[FAIL] policy_heads not importable`, but `pip install -e ./policy_heads`
+  printed no error** -- this happened because `setup_local.sh` used to run
+  every install step through `conda run -n openemma ...`, and `conda run`
+  doesn't always propagate a failing exit code reliably across conda
+  versions, so a broken install could silently fall through to the next
+  step instead of stopping the script. `setup_local.sh` now activates the
+  env directly (`conda activate`) and explicitly verifies this import
+  right after installing it, so a real failure now stops the script with
+  the actual pip error visible. If you hit this with the current
+  `setup_local.sh`, the printed error is the real one to act on -- most
+  often a missing C/C++ toolchain (`sudo apt install build-essential`) or
+  running it outside the `openemma` env.
+- **`setup_local.sh` seems to be taking far longer than a previous run,
+  with no code changes in between** -- almost always pip's dependency
+  resolver backtracking through candidate versions of an *unpinned*
+  package (the only pinned ones are `transformers`, `peft`, `diffusers`,
+  `huggingface_hub`; everything else floats to "latest"), because
+  something upstream published a new release between runs. This isn't a
+  sign anything is broken, just slow -- `du -sh ~/.cache/pip` ticking up
+  every few seconds means it's still actively working, not stuck. Letting
+  it finish once is enough; later runs reuse the pip cache and skip
+  already-satisfied packages, so they're fast again.
