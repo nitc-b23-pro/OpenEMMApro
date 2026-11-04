@@ -64,6 +64,13 @@ dependencies:
       - einops
       - einops-exts
       - bitsandbytes>=0.43
+      # policy_heads/models/position_encoding.py has an unconditional
+      # `import IPython` (just `IPython.embed`, never actually called in
+      # this project's own code path -- a leftover debug import from the
+      # vendored DETR/ACT code) -- without it, "from policy_heads.models
+      # import ConditionalUnet1D" fails transitively even though nothing
+      # we use needs it.
+      - ipython
 
       # --- nuscenes-devkit's OWN deps (it is installed --no-deps in
       #     setup_local.sh, so its real dependency list has to be
