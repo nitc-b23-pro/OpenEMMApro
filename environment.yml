@@ -47,16 +47,23 @@ dependencies:
 
       # --- Diffusion policy head (policy_heads / Tiny-VLA) -------------
       - peft==0.11.1
-      - diffusers==0.27.2
+      # The Kaggle notebook originally pinned diffusers==0.27.2, but that
+      # version imports huggingface_hub.cached_download -- removed in
+      # huggingface_hub 0.26.0 -- while transformers==4.51.3 (above)
+      # requires huggingface-hub>=0.30.0. Those two pins are mutually
+      # exclusive: there's no huggingface_hub version that satisfies both
+      # a diffusers<0.29 install and transformers' own floor. diffusers
+      # dropped its use of cached_download in 0.29.0, so bumping to that
+      # (verified: no cached_download references in its wheel, and its
+      # DDIMScheduler.__init__ still accepts every kwarg build_model.py
+      # passes -- num_train_timesteps/beta_schedule/clip_sample/
+      # clip_sample_range/set_alpha_to_one/prediction_type, all unchanged)
+      # resolves cleanly against transformers 4.51.3 with no further pin
+      # needed on huggingface_hub at all.
+      - diffusers==0.29.0
       - einops
       - einops-exts
       - bitsandbytes>=0.43
-      # diffusers==0.27.2 imports huggingface_hub.cached_download, which
-      # huggingface_hub removed in 0.26.0 -- pinning below 0.26 keeps it
-      # importable. (huggingface_hub's own PyPI metadata for diffusers
-      # 0.27.2 only declares >=0.20.2 with no upper bound, so pip alone
-      # won't stop you from getting a too-new one here.)
-      - huggingface_hub==0.25.2
 
       # --- nuscenes-devkit's OWN deps (it is installed --no-deps in
       #     setup_local.sh, so its real dependency list has to be

@@ -166,9 +166,15 @@ OPENEMMA_CONDA_ENV=myenv ./train_local.sh
   `diffusers==0.27.2` imports a function Hugging Face removed from
   `huggingface_hub` in 0.26.0, and `diffusers`' own PyPI metadata doesn't
   declare an upper bound that would stop pip from installing a too-new
-  one. `environment.yml` pins `huggingface_hub==0.25.2` to fix this --
-  if you still see it, your env predates that pin: `conda activate
-  openemma && pip install "huggingface_hub==0.25.2"`.
+  one. `transformers==4.51.3` separately requires `huggingface-hub>=0.30.0`,
+  so pinning `huggingface_hub` down to keep `diffusers==0.27.2` happy is a
+  dead end -- the two constraints directly conflict (pip will say so:
+  "ResolutionImpossible"). `environment.yml` instead pins
+  `diffusers==0.29.0`, the first release that dropped `cached_download`
+  (verified: no reference to it in that wheel, and the exact
+  `DDIMScheduler` kwargs `build_model.py` uses are all still accepted).
+  If you still see this, your env predates that pin: `conda activate
+  openemma && pip install "diffusers==0.29.0"`.
 - **`[FAIL] nuscenes   No module named 'sklearn'`** (or `scipy`, `shapely`,
   `pycocotools`) -- `nuscenes-devkit` is installed with `--no-deps` (see
   "Why two install stages" above), so its real runtime dependencies have
