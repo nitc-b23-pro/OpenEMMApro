@@ -68,7 +68,7 @@ def check_cuda():
 
 def check_policy_heads():
     try:
-        from policy_heads.models.droid_unet_diffusion import ConditionalUnet1D  # noqa: F401
+        from policy_heads.models import ConditionalUnet1D  # noqa: F401 -- same import build_model.py uses
         print("  [ok] policy_heads (editable install of this repo's diffusion head)")
         return True
     except Exception as e:

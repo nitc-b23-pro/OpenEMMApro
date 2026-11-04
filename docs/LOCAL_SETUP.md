@@ -181,18 +181,32 @@ OPENEMMA_CONDA_ENV=myenv ./train_local.sh
   to be satisfied by `environment.yml` directly; they're all listed there
   now. If you still see this, your env predates that fix: `conda activate
   openemma && pip install scikit-learn scipy "Shapely~=2.0.3" "pycocotools>=2.0.1" "numpy<2.0.0,>=1.22.0"`.
-- **`[FAIL] policy_heads not importable`, but `pip install -e ./policy_heads`
-  printed no error** -- this happened because `setup_local.sh` used to run
-  every install step through `conda run -n openemma ...`, and `conda run`
-  doesn't always propagate a failing exit code reliably across conda
-  versions, so a broken install could silently fall through to the next
-  step instead of stopping the script. `setup_local.sh` now activates the
-  env directly (`conda activate`) and explicitly verifies this import
-  right after installing it, so a real failure now stops the script with
-  the actual pip error visible. If you hit this with the current
-  `setup_local.sh`, the printed error is the real one to act on -- most
-  often a missing C/C++ toolchain (`sudo apt install build-essential`) or
-  running it outside the `openemma` env.
+- **`[FAIL] policy_heads not importable: No module named 'policy_heads'`,
+  even right after `pip install -e ./policy_heads` reports
+  "Successfully installed policy_heads-0.0.0"** -- this was a real bug in
+  `policy_heads/setup.py`, not your environment. That file lives *inside*
+  the `policy_heads/` directory it describes (`policy_heads/setup.py`,
+  sibling to `policy_heads/__init__.py`), so a plain `find_packages()`
+  (relative to setup.py's own directory) can never discover a package
+  literally named `policy_heads` -- it only finds `models`/`util` as
+  bare, wrongly-unprefixed top-level packages, and installs nothing
+  importable as `policy_heads` or `policy_heads.models` (what
+  `build_model.py` actually imports) at all. Fixed with an explicit
+  `package_dir={'policy_heads': '.'}` in `policy_heads/setup.py` --
+  verified directly against this repo's actual `policy_heads/` contents,
+  both that `policy_heads.models.ConditionalUnet1D` imports correctly
+  from an unrelated working directory, and that it's the same code path
+  (`pyproject.toml`-based editable-wheel build) a real run showed. If you
+  still see this, your checkout predates that fix, or your `pip install
+  -e ./policy_heads` cached an old build:
+  `pip install -e ./policy_heads --force-reinstall --no-deps`.
+- (For completeness: `setup_local.sh` also used to run every install step
+  through `conda run -n openemma ...`, whose exit code doesn't always
+  propagate reliably across conda versions -- a real install failure
+  could in principle slip past `set -e` unnoticed. It now activates the
+  env directly with `conda activate` and checks each critical import
+  explicitly, so a genuine failure stops the script with the real pip
+  error visible instead of reaching a misleading "Setup done.")
 - **`setup_local.sh` seems to be taking far longer than a previous run,
   with no code changes in between** -- almost always pip's dependency
   resolver backtracking through candidate versions of an *unpinned*

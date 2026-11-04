@@ -53,7 +53,7 @@ python -c "import nuscenes" || {
 echo "==> Installing policy_heads (editable install of this repo's vendored "
 echo "    diffusion policy head -- not a published package, can't live in environment.yml)"
 pip install -e ./policy_heads
-python -c "from policy_heads.models.droid_unet_diffusion import ConditionalUnet1D" || {
+python -c "from policy_heads.models import ConditionalUnet1D" || {
   echo "ERROR: 'pip install -e ./policy_heads' did not leave policy_heads importable." >&2
   echo "Re-run manually to see the real error:" >&2
   echo "  conda activate $ENV_NAME && pip install -e ./policy_heads" >&2
