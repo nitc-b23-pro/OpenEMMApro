@@ -1,9 +1,37 @@
 """
 build_model.py
-Qwen2.5-VL-3B-Instruct backbone + LoRA + a diffusion policy head for
-OpenEMMA local trajectory prediction. The head lives outside the LoRA-
-wrapped backbone as a sibling module (OpenEMMAPolicy), so its weights are
-saved/loaded separately from the backbone's LoRA adapter.
+LLaVA-Pythia backbone + LoRA + a diffusion policy head for OpenEMMA local
+trajectory prediction. The head lives outside the LoRA-wrapped backbone as
+a sibling module (OpenEMMAPolicy), so its weights are saved/loaded
+separately from the backbone's LoRA adapter.
+
+BACKBONE-SWAP NOTE (kaggle-lp branch): this mirrors the Qwen2.5-VL branch's
+build_model.py almost line for line -- OpenEMMAPolicy (the diffusion head,
+DDIMScheduler config, and critically the percentile-based action/state
+normalization fix from commit 69e604b / claude/diffusion-head-shortcut-
+learning-diagnosis.md) is copied UNCHANGED. Only the backbone loading
+(_load_backbone), LoRA target-module discovery (find_linear_names), and
+OpenEMMAPolicy._hidden_states()/forward()'s call signature differ, because
+LLaVA-Pythia's own forward() takes `images` (a single pre-processed image
+tensor) instead of Qwen's `pixel_values`/`image_grid_thw` pair.
+
+WHY THIS BACKBONE IS LOADED WITH action_head_type="external": the ORIGINAL
+LLaVA-Pythia pipeline (still on branch kaggle-tiny-ft) builds its diffusion
+head INSIDE LlavaPythiaForCausalLM itself (action_head_type="droid_diffusion"),
+diffusing RAW, unnormalized [speed, curvature*100] values through a
+DDIMScheduler(clip_sample=True) that silently clamps every sample to
+[-1, 1]. That is the exact bug diagnosed and fixed on the Qwen branch
+(commit 69e604b) -- loss looks fine, but ADE plateaus near-identically
+regardless of backbone or config, because ~30%+ of predictions were pinned
+to the clip boundary. Reviving the LLaVA-Pythia backbone from before that
+fix existed would silently reintroduce it. Instead, llava_pythia.py (the
+vendored model file) has been patched with a small "external" action-head
+sentinel: LlavaPythiaForCausalLM is used purely as a hidden-states
+producer (embed_out/proj_to_action become inert nn.Identity() placeholders
+inside it, never trained or called), and OpenEMMAPolicy below -- the SAME
+already-proven, already-normalized diffusion head used on the Qwen branch
+-- owns the actual diffusion process. See llava_pythia.py's __init__ and
+forward() for the two small patched branches.
 """
 import os
 
@@ -20,23 +48,10 @@ import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from peft import LoraConfig, PeftModel, get_peft_model
 from policy_heads.models import ConditionalUnet1D
-from transformers import BitsAndBytesConfig, Qwen2_5_VLForConditionalGeneration
 
-try:
-    import bitsandbytes  # noqa: F401
-    from peft import prepare_model_for_kbit_training
-    BNB_AVAILABLE = True
-except ImportError:
-    BNB_AVAILABLE = False
-
-# Load the frozen backbone in 4-bit (QLoRA-style) when bitsandbytes is
-# available -- the backbone's own weights never need to update, so the
-# precision loss only affects the (frozen) forward pass, not what LoRA
-# learns. On a GPU with ~15GB this is the difference between fitting and
-# not: a 3B-param fp16 backbone alone is already ~7GB, before any LoRA
-# deltas, optimizer state, or activations. Set OPENEMMA_USE_4BIT=0 to force
-# fp16 loading instead (e.g. for debugging numerics).
-USE_4BIT = BNB_AVAILABLE and os.environ.get("OPENEMMA_USE_4BIT", "1") != "0"
+from llava_pythia.model.language_model.pythia.configuration_llava_pythia import LlavaPythiaConfig
+from llava_pythia.model.language_model.pythia.llava_pythia import LlavaPythiaForCausalLM
+from llava_pythia.llava_pythia_utils import find_all_linear_names
 
 ACTION_DIM = 2    # [speed, curvature] per predicted step
 STATE_DIM = 20    # 10 history steps x 2 numbers, flattened
@@ -62,6 +77,8 @@ def compute_action_stats(dataset, low_pct=ACTION_STATS_LOW_PCT, high_pct=ACTION_
     openemma_dataset.py), so one set of bounds -- computed by pooling every
     observed AND future step across the whole training set -- normalizes
     both consistently. Returns (low, high), each shape (ACTION_DIM,).
+
+    Backbone-agnostic -- copied verbatim from the Qwen branch.
     """
     all_vals = np.concatenate(
         [np.concatenate([s["obs"], s["fut"]], axis=0) for s in dataset.samples], axis=0
@@ -73,32 +90,39 @@ def compute_action_stats(dataset, low_pct=ACTION_STATS_LOW_PCT, high_pct=ACTION_
 
 def find_linear_names(model):
     """
-    nn.Linear names in the language-model decoder only. The vision tower
-    (`visual.*`) is deliberately excluded: none of its own weights need to
-    update for this task, and keeping it out of LoRA means none of its
-    inputs require grad, so PyTorch skips building a backward graph
-    through it entirely instead of retaining activations for every ViT
-    layer. That's the difference between fitting on a 15GB GPU and not.
+    LoRA target-module names for the LLaVA-Pythia backbone: both the ViT
+    and the Pythia/GPT-NeoX decoder's nn.Linear layers. lora_module=
+    "vit llm" matches the original LLaVA-Pythia project's own setting (see
+    claude/project-context.md: "LoRA patches at both the ViT and the LLM
+    modules") -- unlike the Qwen branch, which deliberately EXCLUDES the
+    vision tower from LoRA to fit a 3B model's memory budget (see Qwen
+    build_model.py's find_linear_names docstring). LLaVA-Pythia is ~1.3B
+    params and fits fp16 comfortably on a 14-16GB GPU, so there's no need
+    to make that same tradeoff here -- this matches the proven original
+    LLaVA-Pythia recipe instead. find_all_linear_names() already excludes
+    embed_out/proj_to_action/mm_projector/vision_resampler/lm_head itself.
     """
-    return sorted(
-        name for name, module in model.named_modules()
-        if isinstance(module, nn.Linear)
-        and not name.endswith("lm_head")
-        and "visual" not in name.split(".")
-    )
+    return find_all_linear_names(model, print, lora_module="vit llm")
 
 
 class OpenEMMAPolicy(nn.Module):
-    """LoRA-wrapped Qwen2.5-VL backbone + a diffusion policy head."""
+    """LoRA-wrapped LLaVA-Pythia backbone + a diffusion policy head.
 
-    def __init__(self, backbone, hidden_size, backbone_is_quantized=False):
+    Identical in substance to the Qwen2.5-VL branch's OpenEMMAPolicy --
+    same ConditionalUnet1D head, same DDIMScheduler config, same
+    normalize()/denormalize()/forward()/save_pretrained() logic (commit
+    69e604b). Only _hidden_states() and forward()'s call signature differ,
+    to match LLaVA-Pythia's own forward(), which takes `images` instead of
+    Qwen's `pixel_values`/`image_grid_thw` pair. There is no 4-bit-
+    quantization branch here (unlike the Qwen version): LLaVA-Pythia is
+    small enough (~1.3B params, ~2.6GB fp16) that plain fp16 loading is
+    the proven, sufficient approach -- matching how this backbone was
+    always loaded in the original (pre-Qwen) pipeline.
+    """
+
+    def __init__(self, backbone, hidden_size):
         super().__init__()
         self.backbone = backbone
-        # A 4-bit-quantized backbone is already placed on its device via
-        # device_map at load time; transformers raises if you then call
-        # .cuda()/.to() on it again. So when quantized, .cuda()/.to() only
-        # move this policy's own (unquantized) diffusion head.
-        self._backbone_is_quantized = backbone_is_quantized
         self.action_dim = ACTION_DIM
         self.num_queries = CHUNK_SIZE
         self.num_inference_timesteps = 10
@@ -122,8 +146,7 @@ class OpenEMMAPolicy(nn.Module):
         # units ([speed in m/s, curvature*100], curvature*100 alone can run
         # to +-200+), so without normalizing first, that clamp isn't a
         # helpful prior, it's a hard ceiling miles below the real target
-        # scale: every sample gets crushed into [-1, 1] regardless of what
-        # it should have been, independent of image/history conditioning.
+        # scale -- see this file's module docstring for the full history.
         # set_action_stats() (called by train_openemma.py right after
         # building the dataset, or by build_openemma() when loading a
         # checkpoint) must be called before forward() will run.
@@ -157,28 +180,15 @@ class OpenEMMAPolicy(nn.Module):
     def enable_input_require_grads(self):
         self.backbone.enable_input_require_grads()
 
-    def cuda(self, device=None):
-        if self._backbone_is_quantized:
-            self.embed_out = self.embed_out.cuda(device)
-            return self
-        return super().cuda(device)
-
-    def to(self, *args, **kwargs):
-        if self._backbone_is_quantized:
-            self.embed_out = self.embed_out.to(*args, **kwargs)
-            return self
-        return super().to(*args, **kwargs)
-
-    def _hidden_states(self, input_ids, attention_mask, pixel_values, image_grid_thw):
+    def _hidden_states(self, input_ids, attention_mask, images):
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=torch.cuda.is_available()):
             out = self.backbone(
-                input_ids=input_ids, attention_mask=attention_mask,
-                pixel_values=pixel_values, image_grid_thw=image_grid_thw,
+                input_ids=input_ids, attention_mask=attention_mask, images=images,
                 output_hidden_states=True, return_dict=True, use_cache=False,
             )
         return out.hidden_states[-1]
 
-    def forward(self, input_ids, attention_mask=None, pixel_values=None, image_grid_thw=None,
+    def forward(self, input_ids, attention_mask=None, images=None,
                 states=None, actions=None, eval=False, **_unused):
         if not self._stats_set:
             raise RuntimeError(
@@ -187,7 +197,7 @@ class OpenEMMAPolicy(nn.Module):
                 "constructing the dataset), or load a checkpoint through build_openemma(), which "
                 "restores them from action_stats.pt."
             )
-        hidden_states = self._hidden_states(input_ids, attention_mask, pixel_values, image_grid_thw).float()
+        hidden_states = self._hidden_states(input_ids, attention_mask, images).float()
 
         # `states` arrives flattened (B, STATE_DIM) -- reshape to (B, steps,
         # ACTION_DIM) to normalize per-dimension like `actions`, then flatten
@@ -236,22 +246,25 @@ class OpenEMMAPolicy(nn.Module):
 
 
 def _load_backbone(pretrained_path):
-    load_kwargs = dict(
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        ),
-        device_map={"": 0} if torch.cuda.is_available() else "cpu",
-    ) if USE_4BIT else dict(torch_dtype=torch.float16)
+    config = LlavaPythiaConfig.from_pretrained(pretrained_path, trust_remote_code=True)
+    # action_head_type="external": see this file's module docstring and
+    # llava_pythia.py's patched __init__/forward -- this backbone is used
+    # purely as a hidden-states producer, never its own native
+    # (unnormalized) diffusion head.
+    config.action_head_type = "external"
+    config.action_dim = ACTION_DIM
+    config.state_dim = STATE_DIM
+    config.chunk_size = CHUNK_SIZE
+    config.concat = "None"   # single front camera only -- no multi-view fusion
 
     try:
-        return Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            pretrained_path, attn_implementation="sdpa", **load_kwargs,
+        return LlavaPythiaForCausalLM.from_pretrained(
+            pretrained_path, config=config, torch_dtype=torch.float16, attn_implementation="sdpa",
         )
-    except (TypeError, ValueError):
-        return Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained_path, **load_kwargs)
+    except (TypeError, ValueError) as e:
+        print(f"[build_model] attn_implementation='sdpa' not supported here ({e}); "
+              f"falling back to default attention (still fp16).")
+        return LlavaPythiaForCausalLM.from_pretrained(pretrained_path, config=config, torch_dtype=torch.float16)
 
 
 def build_openemma(pretrained_path, trained_checkpoint_path=None):
@@ -262,11 +275,20 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
     Loading a trained checkpoint: build_openemma(pretrained_path,
     trained_checkpoint_path=...) -> loads the saved LoRA + diffusion head
     weights on top of the same base backbone.
+
+    NOTE: the original LLaVA-Pythia pipeline needed an explicit
+    reset_parameters() pass here to fix a real from_pretrained()
+    fast-init bug (Conv1d/GroupNorm params inside its native diffusion
+    head left as uninitialized memory -- see claude/project-context.md,
+    bug #6). That bug doesn't apply here: embed_out is loaded as an inert
+    nn.Identity() placeholder (action_head_type="external", see
+    llava_pythia.py), which has no such parameters, and the REAL diffusion
+    head (OpenEMMAPolicy.embed_out, a ConditionalUnet1D) is constructed
+    directly via its own __init__ below, never through from_pretrained()'s
+    fast-init path -- the exact same reasoning that already let the Qwen
+    branch skip this fix.
     """
     backbone = _load_backbone(pretrained_path)
-    if USE_4BIT:
-        backbone = prepare_model_for_kbit_training(backbone, use_gradient_checkpointing=False)
-
     hidden_size = backbone.config.hidden_size
 
     lora_config = LoraConfig(
@@ -280,14 +302,14 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
         for p in backbone.parameters():
             if p.requires_grad:
                 p.data = p.data.float()
-        return OpenEMMAPolicy(backbone, hidden_size, backbone_is_quantized=USE_4BIT)
+        return OpenEMMAPolicy(backbone, hidden_size)
 
     backbone = PeftModel.from_pretrained(backbone, trained_checkpoint_path, is_trainable=False)
     for name, p in backbone.named_parameters():
         if "lora_" in name:
             p.data = p.data.float()
 
-    model = OpenEMMAPolicy(backbone, hidden_size, backbone_is_quantized=USE_4BIT)
+    model = OpenEMMAPolicy(backbone, hidden_size)
     head_state = torch.load(os.path.join(trained_checkpoint_path, "diffusion_head.pt"), map_location="cpu")
     model.embed_out.load_state_dict(head_state)
     model.embed_out = model.embed_out.float()

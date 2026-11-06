@@ -16,7 +16,6 @@ Werkzeug
 
 transformers==4.51.3
 ultralytics
-qwen_vl_utils
 pyquaternion
 
 pandas
@@ -26,12 +25,28 @@ thop
 # huggingface_hub # for models
 # azureml-fsspec # for extracting nuscenes in azure cloud
 
-# # command to run
-# python main.py --model-path qwen --dataroot data/nuscenes_mini --version v1.0-mini --method openemma
+# NOT in this file -- install separately in the notebook, same pattern as
+# policy_heads (see below): diffusers, peft, bitsandbytes, nuscenes-devkit.
+# See docs/LOCAL_SETUP.md / this branch's "additional Kaggle steps" notes
+# for exact pins.
 
-# # command to download qwenVL model 2.5 
-# hf download Qwen/Qwen2.5-VL-3B-Instruct --local-dir models/Qwen2.5-VL-3B-Instruct 
-# huggingface-cli download liuhaotian/llava-v1.6-mistral-7b --local-dir models/llava-v1.6-mistral-7b --local-dir-use-symlinks False
+# # BACKBONE (kaggle-lp branch): LLaVA-Pythia, not Qwen2.5-VL -- see
+# # claude/project-context.md for the full history of why.
+# # command to run
+# python main.py --model-path lp --dataroot data/nuscenes_mini --version v1.0-mini --method openemma
+
+# # the vendored llava-pythia/ and policy_heads/ packages are NOT on PyPI --
+# # install both as local editable packages, --no-deps (their own
+# # pyproject.toml/setup.py pin ancient transformers/peft/torch versions
+# # that would clobber the pins above):
+# pip install -e ./llava-pythia --no-deps
+# pip install -e ./policy_heads --no-deps
+
+# # command to download the LLaVA-Pythia checkpoint (Kaggle model input,
+# # "H" variant, ~2.65GB) -- see kaggle.com/models/latheeshpoondla/llava-pythia
+# # attach it to the notebook as a Kaggle Model input rather than downloading;
+# # BASE_PRETRAINED / PRETRAINED (main.py / train_openemma.py) then point at
+# # /kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/
 
 # python -c "import torch; print(torch.cuda.is_available())" # to check for cuda-torch
 # pip uninstall torch torchvision torchaudio -y # to uninstall existing torch (if installed for cpu)

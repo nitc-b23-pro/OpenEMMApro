@@ -1,9 +1,20 @@
 """
 train_openemma.py
 Trains the OpenEMMA diffusion policy head + LoRA adapters on a
-Qwen2.5-VL-3B-Instruct backbone (build_model.py) for local trajectory
-prediction on nuScenes: scene-level train/val split, per-epoch loss
-tracking, periodic real (meters) validation ADE, and checkpointing.
+LLaVA-Pythia backbone (build_model.py) for local trajectory prediction on
+nuScenes: scene-level train/val split, per-epoch loss tracking, periodic
+real (meters) validation ADE, and checkpointing.
+
+BACKBONE-SWAP NOTE (kaggle-lp branch): this is the Qwen2.5-VL branch's
+train_openemma.py with ONLY the backbone-specific pieces swapped --
+PRETRAINED's default path, the model/tokenizer/image_processor loading,
+and preprocess_batch()'s body (tokenizer_image_token + CLIPImageProcessor
+instead of qwen_vl_utils' chat-template + process_vision_info). Every
+other line -- the training loop, OOM handling, grad accumulation,
+NaN-loss guard, validation loss, validation ADE, checkpointing, plotting
+-- is unchanged, because build_model.py's OpenEMMAPolicy.forward() takes
+the exact same (input_ids, attention_mask, <image kwarg>, states, actions,
+eval) shape regardless of which backbone sits underneath it.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -17,25 +28,22 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from PIL import Image
-from qwen_vl_utils import process_vision_info
 from torch.utils.data import DataLoader, Subset
-from transformers import AutoProcessor
+from transformers import AutoTokenizer, CLIPImageProcessor
 
 from build_model import build_openemma, compute_action_stats
 from openemma_dataset import OpenEMMADataset
 from utils import IntegrateCurvatureForPoints
+from llava_pythia.mm_utils import tokenizer_image_token
+from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 
-# EDIT ME (or set the OPENEMMA_QWEN_PATH env var): local directory holding
-# Qwen2.5-VL-3B-Instruct's weights/config/processor files -- must be a real
-# path on disk, not a HF Hub repo id. If your Kaggle input's
-# preprocessor_config.json isn't recognized by the installed transformers
-# version, fix it in a working copy (e.g. symlink the input dir into
-# /kaggle/working/ and patch image_processor_type/processor_class there)
-# and point this at that copy -- not the raw input. Keep in sync with
-# main.py's BASE_PRETRAINED.
-PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
-DATAROOT = "/kaggle/working/nuscenes_test_root/"
-VERSION = "v1.0-test"
+# EDIT ME (or set the OPENEMMA_LP_PATH env var): local directory holding
+# LLaVA-Pythia's weights/config/tokenizer files -- must be a real path on
+# disk (e.g. the Kaggle model input mount), not a HF Hub repo id. Keep in
+# sync with main.py's BASE_PRETRAINED.
+PRETRAINED = os.environ.get("OPENEMMA_LP_PATH", "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
+DATAROOT = os.environ.get("OPENEMMA_DATAROOT", "/kaggle/working/nuscenes_test_root/")
+VERSION = os.environ.get("OPENEMMA_VERSION", "v1.0-test")
 
 VAL_FRACTION = 0.1
 SPLIT_SEED = 42
@@ -46,18 +54,15 @@ DT_ADE = 0.5
 ADE_EVAL_EVERY = 5
 ADE_EVAL_SAMPLES = 64
 
-# Fixed (not just capped) visual-token budget: MIN==MAX means every frame
-# becomes exactly the same sequence length, so memory use no longer varies
-# frame to frame. With a range, GPU memory was staying pinned within a few
-# dozen MB of the limit for most frames, and the occasional frame needing
-# more tokens than usual was enough to OOM. Keep this in sync with
-# main.py's MIN_PIXELS/MAX_PIXELS so inference sees the same token budget
-# the model was trained on.
-MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 256 * 28 * 28
-
 model = build_openemma(PRETRAINED).cuda()
-processor = AutoProcessor.from_pretrained(PRETRAINED, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
+tokenizer = AutoTokenizer.from_pretrained(PRETRAINED)
+if tokenizer.pad_token_id is None:
+    # Pythia/GPT-NeoX tokenizers commonly ship with no pad token set --
+    # fall back to eos, the standard choice (only matters for padding
+    # across a >1-sized batch; BATCH_SIZE=1 below means this never
+    # actually gets used to pad real training text, just defensive).
+    tokenizer.pad_token = tokenizer.eos_token
+image_processor = CLIPImageProcessor.from_pretrained(PRETRAINED)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 
@@ -106,8 +111,9 @@ param_groups = [
 try:
     # 8-bit optimizer state (bitsandbytes) instead of AdamW's usual two
     # fp32 moment buffers per parameter -- roughly a 4x cut in optimizer
-    # memory, which matters once the GPU is already tight from the 4-bit
-    # backbone + activations (see build_model.py's USE_4BIT).
+    # memory. Less critical here than on the Qwen branch (no 4-bit
+    # backbone competing for the same budget), but kept for consistency
+    # and because it's free when available.
     import bitsandbytes as bnb
     optimizer = bnb.optim.PagedAdamW8bit(param_groups)
 except ImportError:
@@ -115,21 +121,33 @@ except ImportError:
 
 
 def preprocess_batch(batch):
-    messages = []
+    input_ids_list, images_list = [], []
     for image_path, raw_lang in zip(batch["image_path"], batch["raw_lang"]):
+        prompt = DEFAULT_IMAGE_TOKEN + "\n" + raw_lang
+        input_ids_list.append(tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"))
         img = Image.open(image_path).convert("RGB")
-        messages.append([{"role": "user", "content": [
-            {"type": "image", "image": img},
-            {"type": "text", "text": raw_lang},
-        ]}])
+        images_list.append(image_processor.preprocess(img, return_tensors="pt")["pixel_values"][0])
 
-    texts = [processor.apply_chat_template(m, tokenize=False, add_generation_prompt=True) for m in messages]
-    image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(text=texts, images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
-    inputs = {k: v.cuda() for k, v in inputs.items()}
-    if "pixel_values" in inputs:
-        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch.float16)
-    return inputs
+    max_len = max(x.shape[0] for x in input_ids_list)
+    padded_ids = torch.stack([
+        torch.nn.functional.pad(x, (0, max_len - x.shape[0]), value=tokenizer.pad_token_id)
+        for x in input_ids_list
+    ])
+    attention_mask = torch.stack([
+        torch.cat([torch.ones(x.shape[0], dtype=torch.long),
+                   torch.zeros(max_len - x.shape[0], dtype=torch.long)])
+        for x in input_ids_list
+    ])
+    # FIXED (dtype mismatch): build_model.py loads the base VLM (including
+    # mm_projector, plain nn.Linear -- not LoRA-adapted, so there is no
+    # PEFT-level dtype auto-casting protecting it) in fp16. CLIPVisionTower's
+    # own forward() casts its OUTPUT back to match whatever dtype the INPUT
+    # image tensor was, so it must already be fp16 here.
+    return {
+        "input_ids": padded_ids.cuda(),
+        "attention_mask": attention_mask.cuda(),
+        "images": torch.stack(images_list).cuda().half(),
+    }
 
 
 def run_validation():

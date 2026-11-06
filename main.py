@@ -1,9 +1,18 @@
 """
 main.py
-Inference + ADE evaluation entrypoint for OpenEMMA on a Qwen2.5-VL-3B-
-Instruct backbone (build_model.py): loads a trained checkpoint, runs it
-over nuScenes scenes, reconstructs predicted trajectories with a
-kinematic bicycle-model integration, and reports per-scene ADE@1s/2s/3s.
+Inference + ADE evaluation entrypoint for OpenEMMA on a LLaVA-Pythia
+backbone (build_model.py): loads a trained checkpoint, runs it over
+nuScenes scenes, reconstructs predicted trajectories with a kinematic
+bicycle-model integration, and reports per-scene ADE@1s/2s/3s.
+
+BACKBONE-SWAP NOTE (kaggle-lp branch): this is the Qwen2.5-VL branch's
+main.py with ONLY the backbone-specific pieces swapped -- BASE_PRETRAINED's
+default path, load_model_and_processor() (now returns a tokenizer +
+image_processor pair instead of one combined AutoProcessor), and
+predict_step()'s preprocessing (tokenizer_image_token + CLIPImageProcessor
+instead of the chat-template + qwen_vl_utils path). run_inference_on_scenes
+-- the scene walk, YOLO3D overlay, kinematic-integration ADE computation,
+plotting/video writing -- is unchanged line for line.
 """
 import argparse
 import os
@@ -21,12 +30,13 @@ import matplotlib.pyplot as plt
 import torch
 from nuscenes import NuScenes
 from PIL import Image
-from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor
+from transformers import AutoTokenizer, CLIPImageProcessor
 
 from openemma.YOLO3D.inference import yolo3d_nuScenes
 from utils import EstimateCurvatureFromTrajectory, IntegrateCurvatureForPoints, OverlayTrajectory, WriteImageSequenceToVideo
 from build_model import build_openemma
+from llava_pythia.mm_utils import tokenizer_image_token
+from llava_pythia.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from prompts import build_prompt
 
 OBS_LEN = 10
@@ -34,56 +44,49 @@ FUT_LEN = 10
 TTL_LEN = OBS_LEN + FUT_LEN
 DT = 0.5
 
-# EDIT ME (or set the OPENEMMA_QWEN_PATH env var): local directory holding
-# Qwen2.5-VL-3B-Instruct's weights/config/processor files -- must be a real
-# path on disk, not a HF Hub repo id. If your Kaggle input's
-# preprocessor_config.json isn't recognized by the installed transformers
-# version, fix it in a working copy (e.g. symlink the input dir into
-# /kaggle/working/ and patch image_processor_type/processor_class there)
-# and point this at that copy -- not the raw input. Keep in sync with
-# train_openemma.py's PRETRAINED.
-BASE_PRETRAINED = os.environ.get("OPENEMMA_QWEN_PATH", "/kaggle/working/qwen2.5-vl-3b-fixed")
-
-# Fixed (MIN==MAX) visual-token budget -- every frame becomes exactly the
-# same sequence length, matching train_openemma.py so inference sees what
-# the model was actually trained on, and keeping memory use predictable.
-MIN_PIXELS = 256 * 28 * 28
-MAX_PIXELS = 256 * 28 * 28
+# EDIT ME (or set the OPENEMMA_LP_PATH env var): local directory holding
+# LLaVA-Pythia's weights/config/tokenizer files -- must be a real path on
+# disk (e.g. the Kaggle model input mount), not a HF Hub repo id. Keep in
+# sync with train_openemma.py's PRETRAINED.
+BASE_PRETRAINED = os.environ.get("OPENEMMA_LP_PATH", "/kaggle/input/models/latheeshpoondla/llava-pythia/transformers/h/1/")
 
 
 def load_model_and_processor(base_pretrained=BASE_PRETRAINED, trained_checkpoint_path=None):
     model = build_openemma(base_pretrained, trained_checkpoint_path=trained_checkpoint_path).cuda().eval()
-    processor = AutoProcessor.from_pretrained(base_pretrained, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
-    return model, processor
+    tokenizer = AutoTokenizer.from_pretrained(base_pretrained)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    image_processor = CLIPImageProcessor.from_pretrained(base_pretrained)
+    return model, tokenizer, image_processor
 
 
-def predict_step(image_path, obs_velocities, obs_curvatures, model, processor):
+def predict_step(image_path, obs_velocities, obs_curvatures, model, tokenizer, image_processor):
     obs_norm = np.linalg.norm(obs_velocities, axis=1)
     obs_curv = obs_curvatures * 100
     obs = np.stack([obs_norm, obs_curv], axis=1)
     state = torch.from_numpy(obs.flatten().astype(np.float32)).unsqueeze(0).cuda()
 
     raw_lang = build_prompt(obs)
+    prompt = DEFAULT_IMAGE_TOKEN + "\n" + raw_lang
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX,
+                                       return_tensors="pt").unsqueeze(0).cuda()
+    attention_mask = torch.ones_like(input_ids)
 
     img = Image.open(image_path).convert("RGB")
-    message = [{"role": "user", "content": [
-        {"type": "image", "image": img},
-        {"type": "text", "text": raw_lang},
-    ]}]
-    text = processor.apply_chat_template(message, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs = process_vision_info(message)
-    inputs = processor(text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt")
-    inputs = {k: v.cuda() for k, v in inputs.items()}
-    if "pixel_values" in inputs:
-        inputs["pixel_values"] = inputs["pixel_values"].to(dtype=torch.float16)
+    # FIXED (dtype mismatch): the base VLM (including mm_projector, plain
+    # nn.Linear -- not LoRA-adapted) is loaded in fp16. CLIPVisionTower
+    # casts its output back to match whatever dtype the input image
+    # tensor was, so it must already be fp16 here.
+    image_tensor = image_processor.preprocess(img, return_tensors="pt")["pixel_values"].cuda().half()
 
     with torch.inference_mode():
-        pred = model(**inputs, states=state, eval=True)
+        pred = model(input_ids=input_ids, attention_mask=attention_mask, images=image_tensor,
+                     states=state, eval=True)
 
     return pred[0].cpu().numpy().tolist(), raw_lang
 
 
-def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
+def run_inference_on_scenes(nusc, scenes, model, tokenizer, image_processor, output_dir, args):
     results = []
     frame_count, frame_time_total = 0, 0.0
 
@@ -146,7 +149,7 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
             img = cv2.imread(current_image)
             img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
 
-            speed_curvature_pred, raw_lang = predict_step(current_image, obs_velocities, obs_curvatures, model, processor)
+            speed_curvature_pred, raw_lang = predict_step(current_image, obs_velocities, obs_curvatures, model, tokenizer, image_processor)
             speed_curvature_pred = speed_curvature_pred[:FUT_LEN]
             print(f"Got {len(speed_curvature_pred)} future actions: {speed_curvature_pred}")
 
@@ -213,7 +216,7 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model-path", type=str, default="qwen")
+    parser.add_argument("--model-path", type=str, default="lp")
     parser.add_argument("--plot", type=bool, default=True)
     parser.add_argument("--epoch", type=str, default="/kaggle/working/OpenEMMApro/openemma_epoch0/")
     parser.add_argument("--dataroot", type=str, default="datasets/NuScenes")
@@ -221,7 +224,7 @@ if __name__ == "__main__":
     parser.add_argument("--method", type=str, default="openemma")
     args = parser.parse_args()
 
-    model, processor = load_model_and_processor(BASE_PRETRAINED, args.epoch)
+    model, tokenizer, image_processor = load_model_and_processor(BASE_PRETRAINED, args.epoch)
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = f"{args.model_path}_results/{args.method}/{timestamp}"
@@ -230,4 +233,4 @@ if __name__ == "__main__":
     nusc = NuScenes(version=args.version, dataroot=args.dataroot)
     print(f"Number of scenes: {len(nusc.scene)}")
 
-    run_inference_on_scenes(nusc, nusc.scene, model, processor, output_dir, args)
+    run_inference_on_scenes(nusc, nusc.scene, model, tokenizer, image_processor, output_dir, args)

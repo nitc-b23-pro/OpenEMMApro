@@ -90,7 +90,7 @@ def plot_comparison(train_summary, test_summary, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--model-path", type=str, default="qwen")
+    parser.add_argument("--model-path", type=str, default="lp")
     parser.add_argument("--epoch", type=str, required=True)
     parser.add_argument("--train-dataroot", type=str, default="/kaggle/working/nuscenes_test_root/")
     parser.add_argument("--train-version", type=str, default="v1.0-test")
@@ -110,7 +110,7 @@ def main():
     os.makedirs(test_dir, exist_ok=True)
 
     print(f"Loading model from checkpoint: {args.epoch}")
-    model, processor = load_model_and_processor(BASE_PRETRAINED, args.epoch)
+    model, tokenizer, image_processor = load_model_and_processor(BASE_PRETRAINED, args.epoch)
 
     print(f"Recovering train/val scene split for {args.train_dataroot} ({args.train_version})...")
     train_nusc, train_scene_names, val_scene_names = recover_train_scene_names(args.train_dataroot, args.train_version)
@@ -125,10 +125,10 @@ def main():
     print(f"Evaluating on {len(test_eval_scenes)} test scene(s): {[s['name'] for s in test_eval_scenes]}")
 
     print("\n=== Running inference on TRAIN-split (seen) scenes ===")
-    train_results = run_inference_on_scenes(train_nusc, train_eval_scenes, model, processor, train_dir, args)
+    train_results = run_inference_on_scenes(train_nusc, train_eval_scenes, model, tokenizer, image_processor, train_dir, args)
 
     print("\n=== Running inference on TEST (unseen) scenes ===")
-    test_results = run_inference_on_scenes(test_nusc, test_eval_scenes, model, processor, test_dir, args)
+    test_results = run_inference_on_scenes(test_nusc, test_eval_scenes, model, tokenizer, image_processor, test_dir, args)
 
     train_summary = summarize(train_results)
     test_summary = summarize(test_results)
