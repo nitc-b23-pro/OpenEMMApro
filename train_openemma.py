@@ -4,6 +4,11 @@ Trains the OpenEMMA diffusion policy head + LoRA adapters on a
 Qwen2.5-VL-3B-Instruct backbone (build_model.py) for local trajectory
 prediction on nuScenes: scene-level train/val split, per-epoch loss
 tracking, periodic real (meters) validation ADE, and checkpointing.
+
+With OPENEMMA_VERSION=v1.0-trainval (what train_local.sh sets), it trains
+on nuScenes' official 700-scene train split and validates on the official
+150-scene val split. Final testing on the separate v1.0-test release is done
+by main.py, not here.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -81,12 +86,32 @@ print(f"Action/state normalization bounds (1st/99th percentile): "
       f"speed=[{action_low[0]:.3f}, {action_high[0]:.3f}] m/s, "
       f"curvature*100=[{action_low[1]:.3f}, {action_high[1]:.3f}]")
 
+# Scene-level train/val split. On the full nuScenes trainval release
+# (v1.0-trainval, 850 scenes) use nuScenes' own official split -- 700 train
+# scenes / 150 val scenes -- so validation is on the standard val set and
+# needs no seed. The held-out v1.0-test release (150 scenes) is never used
+# here; it's only used afterwards by main.py for the final test evaluation
+# (train_local.sh runs that step). Any other release (e.g. the Kaggle
+# v1.0-test slice this script was first developed on) keeps the original
+# random VAL_FRACTION scene split.
 scene_names = sorted({s["scene"] for s in dataset.samples})
-rng = random.Random(SPLIT_SEED)
-rng.shuffle(scene_names)
-n_val_scenes = max(1, round(len(scene_names) * VAL_FRACTION))
-val_scenes = set(scene_names[:n_val_scenes])
-train_scenes = set(scene_names[n_val_scenes:])
+if VERSION == "v1.0-trainval":
+    from nuscenes.utils.splits import create_splits_scenes
+    official_splits = create_splits_scenes()
+    train_scenes = set(official_splits["train"]) & set(scene_names)
+    val_scenes = set(official_splits["val"]) & set(scene_names)
+    if not train_scenes or not val_scenes:
+        raise RuntimeError(
+            f"Official nuScenes train/val split matched {len(train_scenes)} train / "
+            f"{len(val_scenes)} val scenes in {DATAROOT} -- check that OPENEMMA_DATAROOT "
+            f"points at a complete v1.0-trainval root."
+        )
+else:
+    rng = random.Random(SPLIT_SEED)
+    rng.shuffle(scene_names)
+    n_val_scenes = max(1, round(len(scene_names) * VAL_FRACTION))
+    val_scenes = set(scene_names[:n_val_scenes])
+    train_scenes = set(scene_names[n_val_scenes:])
 
 train_indices = [i for i, s in enumerate(dataset.samples) if s["scene"] in train_scenes]
 val_indices = [i for i, s in enumerate(dataset.samples) if s["scene"] in val_scenes]

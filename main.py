@@ -143,8 +143,11 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
             current_camera_params = camera_params[i + OBS_LEN - 1]
             current_image = front_camera_images[i + OBS_LEN - 1]
 
-            img = cv2.imread(current_image)
-            img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
+            # YOLO3D boxes + trajectory overlay are visualization only --
+            # skip them with --plot false (e.g. a full 150-scene test run).
+            if args.plot:
+                img = cv2.imread(current_image)
+                img = yolo3d_nuScenes(img, calib=current_camera_params)[0]
 
             speed_curvature_pred, raw_lang = predict_step(current_image, obs_velocities, obs_curvatures, model, processor)
             speed_curvature_pred = speed_curvature_pred[:FUT_LEN]
@@ -158,7 +161,8 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
                 pred_curvatures, pred_speeds, current_position,
                 atan2(obs_velocities[-1][1], obs_velocities[-1][0]), DT,
             )
-            OverlayTrajectory(img, pred_traj.tolist(), current_camera_params, current_pose, color=(255, 0, 0), args=args)
+            if args.plot:
+                OverlayTrajectory(img, pred_traj.tolist(), current_camera_params, current_pose, color=(255, 0, 0), args=args)
 
             err = np.linalg.norm(fut_world[:pred_len] - pred_traj[:pred_len, :2], axis=1)
             ade = float(np.mean(err))
@@ -189,6 +193,10 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
             print(f"[frame {frame_count}] scene={name} idx={i} "
                   f"running_avg_frame_time={frame_time_total / frame_count:.3f}s")
 
+        if not ade1s_list:
+            print(f"Scene {name} produced no evaluable frames, skipping...")
+            continue
+
         mean_ade1s, mean_ade2s, mean_ade3s = float(np.mean(ade1s_list)), float(np.mean(ade2s_list)), float(np.mean(ade3s_list))
         failure_rate = 100.0 * sum(1 for f in ade1s_list if f > 10) / len(ade1s_list)
 
@@ -197,6 +205,7 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
             "ade1s": mean_ade1s, "ade2s": mean_ade2s, "ade3s": mean_ade3s,
             "avgade": float(np.mean([mean_ade1s, mean_ade2s, mean_ade3s])),
             "failure_rate": failure_rate,
+            "n_frames": len(ade1s_list),
         }
         results.append(result)
 
@@ -214,7 +223,10 @@ def run_inference_on_scenes(nusc, scenes, model, processor, output_dir, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", type=str, default="qwen")
-    parser.add_argument("--plot", type=bool, default=True)
+    # type=bool would treat any non-empty string (even "False") as True, so
+    # parse the value explicitly. `--plot false` skips YOLO3D overlays,
+    # per-frame plots and videos.
+    parser.add_argument("--plot", type=lambda s: s.strip().lower() in ("1", "true", "yes", "y"), default=True)
     parser.add_argument("--epoch", type=str, default="/kaggle/working/OpenEMMApro/openemma_epoch0/")
     parser.add_argument("--dataroot", type=str, default="datasets/NuScenes")
     parser.add_argument("--version", type=str, default="v1.0-mini")
@@ -230,4 +242,23 @@ if __name__ == "__main__":
     nusc = NuScenes(version=args.version, dataroot=args.dataroot)
     print(f"Number of scenes: {len(nusc.scene)}")
 
-    run_inference_on_scenes(nusc, nusc.scene, model, processor, output_dir, args)
+    results = run_inference_on_scenes(nusc, nusc.scene, model, processor, output_dir, args)
+
+    # Overall result for the whole split: mean of the per-scene metrics
+    # (same convention as the per-scene ade_results.jsonl rows).
+    if results:
+        summary = {
+            "checkpoint": args.epoch, "dataroot": args.dataroot, "version": args.version,
+            "n_scenes": len(results),
+            "n_frames": int(sum(r["n_frames"] for r in results)),
+        }
+        for key in ("ade1s", "ade2s", "ade3s", "avgade", "failure_rate"):
+            summary[key] = float(np.mean([r[key] for r in results]))
+        with open(f"{output_dir}/summary.json", "w") as f:
+            json.dump(summary, f, indent=4)
+        print(f"Overall ({summary['n_scenes']} scenes, {summary['n_frames']} frames): "
+              f"ADE@1s={summary['ade1s']:.3f} ADE@2s={summary['ade2s']:.3f} "
+              f"ADE@3s={summary['ade3s']:.3f} avgADE={summary['avgade']:.3f} m, "
+              f"failure_rate={summary['failure_rate']:.2f}% -> {output_dir}/summary.json")
+    else:
+        print("No scene produced any evaluable frames -- nothing to summarize.")
