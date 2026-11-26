@@ -30,8 +30,9 @@ for var in OPENEMMA_CONDA_ENV OPENEMMA_QWEN_PATH \
            OPENEMMA_TEST_PLOT OPENEMMA_SKIP_TRAIN; do
   [ -n "${!var:-}" ] || missing+=("$var")
 done
-# OPENEMMA_TEST_CHECKPOINT must be present but may be empty (= auto-pick).
+# These must be present but may be empty (= auto-pick / fresh run).
 [ -n "${OPENEMMA_TEST_CHECKPOINT+x}" ] || missing+=("OPENEMMA_TEST_CHECKPOINT")
+[ -n "${OPENEMMA_RESUME_FROM+x}" ] || missing+=("OPENEMMA_RESUME_FROM")
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "config/local.env is missing: ${missing[*]}" >&2
   echo "(see config/local.env.example for every required setting)" >&2
@@ -49,19 +50,25 @@ echo
 
 # ---- 1. Train (train + val on trainval) ------------------------------------
 if [ "$OPENEMMA_SKIP_TRAIN" != "1" ]; then
-  # train_openemma.py appends to these logs if they already exist; move a
-  # previous run's copies aside so step 2 only sees this run's epochs.
-  backup=""
-  for f in epoch_loss.json val_epoch_losses.json val_ade_epochs.json; do
-    if [ -f "$f" ]; then
-      if [ -z "$backup" ]; then
-        backup="previous_run_$(date +%Y%m%d-%H%M%S)"
-        mkdir -p "$backup"
+  if [ -n "$OPENEMMA_RESUME_FROM" ]; then
+    # Resuming: keep this run's loss/ADE logs and continue them.
+    echo "Resuming training from: $OPENEMMA_RESUME_FROM"
+  else
+    # Fresh run: train_openemma.py appends to these logs if they already
+    # exist; move a previous run's copies aside so step 2 only sees this
+    # run's epochs.
+    backup=""
+    for f in epoch_loss.json val_epoch_losses.json val_ade_epochs.json; do
+      if [ -f "$f" ]; then
+        if [ -z "$backup" ]; then
+          backup="previous_run_$(date +%Y%m%d-%H%M%S)"
+          mkdir -p "$backup"
+        fi
+        mv "$f" "$backup/"
       fi
-      mv "$f" "$backup/"
-    fi
-  done
-  [ -z "$backup" ] || echo "Moved the previous run's loss/ADE logs to $backup/"
+    done
+    [ -z "$backup" ] || echo "Moved the previous run's loss/ADE logs to $backup/"
+  fi
 
   OPENEMMA_DATAROOT="$OPENEMMA_TRAIN_DATAROOT" OPENEMMA_VERSION="$OPENEMMA_TRAIN_VERSION" \
     python train_openemma.py "$@"

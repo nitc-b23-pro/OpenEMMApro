@@ -9,12 +9,17 @@ With OPENEMMA_VERSION=v1.0-trainval (what train_local.sh sets), it trains
 on nuScenes' official 700-scene train split and validates on the official
 150-scene val split. Final testing on the separate v1.0-test release is done
 by main.py, not here.
+
+Resuming: set OPENEMMA_RESUME_FROM to a checkpoint directory (e.g.
+openemma_epoch5) or to "latest" to continue an interrupted run from the
+epoch after that checkpoint, instead of starting again from epoch 0.
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import json
 import random
+import re
 import time
 from math import atan2
 
@@ -64,7 +69,61 @@ ADE_EVAL_SAMPLES = 64
 MIN_PIXELS = 256 * 28 * 28
 MAX_PIXELS = 256 * 28 * 28
 
-model = build_openemma(PRETRAINED).cuda()
+# ---- Resume an interrupted run (optional) ---------------------------------
+# OPENEMMA_RESUME_FROM: empty = fresh run from epoch 0; "latest" = the newest
+# complete openemma_epochN/ checkpoint; or a checkpoint directory. Training
+# continues at the epoch after that checkpoint. The optimizer's state is
+# restored too when RESUME_STATE_FILE (rewritten after every epoch) belongs to
+# that same checkpoint; otherwise the optimizer starts fresh.
+RESUME_FROM = os.environ.get("OPENEMMA_RESUME_FROM", "").strip()
+RESUME_STATE_FILE = "resume_state.pt"
+
+
+def is_complete_checkpoint(path):
+    has_adapter = any(os.path.exists(os.path.join(path, f))
+                      for f in ("adapter_model.safetensors", "adapter_model.bin"))
+    return has_adapter and all(os.path.exists(os.path.join(path, f))
+                               for f in ("adapter_config.json", "diffusion_head.pt", "action_stats.pt"))
+
+
+def resolve_resume_checkpoint(spec):
+    if spec == "latest":
+        found = []
+        for d in os.listdir("."):
+            m = re.fullmatch(r"openemma_epoch(\d+)", d)
+            if m and os.path.isdir(d) and is_complete_checkpoint(d):
+                found.append((int(m.group(1)), d))
+        if not found:
+            raise SystemExit("OPENEMMA_RESUME_FROM=latest, but no complete openemma_epochN/ checkpoint was found.")
+        return max(found)[1]
+    if not (os.path.isdir(spec) and is_complete_checkpoint(spec)):
+        raise SystemExit(f"OPENEMMA_RESUME_FROM={spec} is not a complete checkpoint directory "
+                         "(needs adapter_config.json, adapter weights, diffusion_head.pt, action_stats.pt).")
+    return spec
+
+
+def checkpoint_epoch(path):
+    state_path = os.path.join(path, "training_state.json")
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            return int(json.load(f)["epoch"])
+    # Checkpoints saved before training_state.json existed: read the epoch
+    # from the directory name (openemma_epoch5 -> 5).
+    m = re.search(r"(\d+)$", os.path.basename(os.path.normpath(path)))
+    if not m:
+        raise SystemExit(f"Can't tell which epoch {path} is -- name it openemma_epochN.")
+    return int(m.group(1))
+
+
+if RESUME_FROM:
+    resume_ckpt = resolve_resume_checkpoint(RESUME_FROM)
+    resume_epoch = checkpoint_epoch(resume_ckpt)
+    START_EPOCH = resume_epoch + 1
+    print(f"Resuming from {resume_ckpt} (epoch {resume_epoch}) -> continuing at epoch {START_EPOCH}")
+    model = build_openemma(PRETRAINED, trained_checkpoint_path=resume_ckpt, is_trainable=True).cuda()
+else:
+    resume_ckpt, resume_epoch, START_EPOCH = None, None, 0
+    model = build_openemma(PRETRAINED).cuda()
 processor = AutoProcessor.from_pretrained(PRETRAINED, min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
@@ -80,8 +139,13 @@ dataset = OpenEMMADataset(dataroot=DATAROOT, version=VERSION)
 # only in the sense that it needs `dataset`, not the split itself -- using
 # the full dataset here (not just the train split) is fine since these are
 # just normalization bounds, not something the model can overfit to.
-action_low, action_high = compute_action_stats(dataset)
-model.set_action_stats(action_low, action_high)
+if resume_ckpt is None:
+    action_low, action_high = compute_action_stats(dataset)
+    model.set_action_stats(action_low, action_high)
+else:
+    # Keep the bounds the checkpoint was trained with (build_openemma()
+    # already restored them from its action_stats.pt).
+    action_low, action_high = model.action_low.cpu().numpy(), model.action_high.cpu().numpy()
 print(f"Action/state normalization bounds (1st/99th percentile): "
       f"speed=[{action_low[0]:.3f}, {action_high[0]:.3f}] m/s, "
       f"curvature*100=[{action_low[1]:.3f}, {action_high[1]:.3f}]")
@@ -125,8 +189,13 @@ val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
 # Two learning-rate groups: a small LR for the LoRA patches on the
 # pretrained backbone, a larger one for the from-scratch diffusion head.
-lora_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" not in n]
-head_params = [p for n, p in model.named_parameters() if p.requires_grad and "embed_out" in n]
+lora_named = [(n, p) for n, p in model.named_parameters() if p.requires_grad and "embed_out" not in n]
+head_named = [(n, p) for n, p in model.named_parameters() if p.requires_grad and "embed_out" in n]
+lora_params = [p for _, p in lora_named]
+head_params = [p for _, p in head_named]
+# Saved with the optimizer state so a resume only restores that state onto
+# exactly the same parameters, in the same order.
+param_names = [n for n, _ in lora_named + head_named]
 param_groups = [
     {"params": lora_params, "lr": 2e-4},
     {"params": head_params, "lr": 2e-5},
@@ -136,10 +205,25 @@ try:
     # fp32 moment buffers per parameter -- roughly a 4x cut in optimizer
     # memory, which matters once the GPU is already tight from the 4-bit
     # backbone + activations (see build_model.py's USE_4BIT).
+    # Non-paged AdamW8bit: the paged variant (PagedAdamW8bit) keeps its state
+    # in CUDA unified memory and crashed a long trainval run mid-epoch with
+    # "CUDA error: an illegal memory access" inside its optimizer.step().
     import bitsandbytes as bnb
-    optimizer = bnb.optim.PagedAdamW8bit(param_groups)
+    optimizer = bnb.optim.AdamW8bit(param_groups)
 except ImportError:
     optimizer = torch.optim.AdamW(param_groups)
+
+if resume_ckpt is not None:
+    restored = False
+    if os.path.exists(RESUME_STATE_FILE):
+        resume_state = torch.load(RESUME_STATE_FILE, map_location="cpu", weights_only=False)
+        if resume_state.get("epoch") == resume_epoch and resume_state.get("param_names") == param_names:
+            optimizer.load_state_dict(resume_state["optimizer"])
+            restored = True
+        del resume_state
+    print("Optimizer state restored from " + RESUME_STATE_FILE if restored else
+          f"No matching optimizer state for epoch {resume_epoch} -- the optimizer starts fresh "
+          "(model weights are still resumed).")
 
 
 def preprocess_batch(batch):
@@ -246,11 +330,21 @@ losses = load_json(LOSS_FILE)
 val_losses = load_json(VAL_LOSS_FILE)
 val_ade = load_json(VAL_ADE_FILE)
 
+if resume_ckpt is not None:
+    # Drop log entries from epochs that are about to be re-trained (e.g. from
+    # the run that was interrupted), so the logs and the best-checkpoint pick
+    # only describe this run's epochs.
+    for log in (losses, val_losses, val_ade):
+        for key in [k for k in log if k.startswith("epoch-") and int(k.split("-")[1]) >= START_EPOCH]:
+            del log[key]
+    if START_EPOCH >= EPOCHS:
+        print(f"Checkpoint epoch {resume_epoch} is already the last epoch (EPOCHS={EPOCHS}) -- nothing left to train.")
+
 global_frame_count = 0
 total_process_time = 0.0
 optimizer.zero_grad()
 
-for epoch in range(EPOCHS):
+for epoch in range(START_EPOCH, EPOCHS):
     print(f"Epoch {epoch} running...")
     epoch_loss, epoch_steps = 0.0, 0
 
@@ -313,7 +407,15 @@ for epoch in range(EPOCHS):
         val_ade[f"epoch-{epoch}"] = ade_summary
         save_json(VAL_ADE_FILE, val_ade)
 
-    model.save_pretrained(f"openemma_epoch{epoch}")
+    ckpt_dir = f"openemma_epoch{epoch}"
+    model.save_pretrained(ckpt_dir)
+    with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
+        json.dump({"epoch": epoch}, f)
+    # Optimizer state for resuming -- one rolling file (overwritten every
+    # epoch) rather than a copy per checkpoint, since it's several hundred MB.
+    torch.save({"epoch": epoch, "checkpoint": ckpt_dir, "param_names": param_names,
+                "optimizer": optimizer.state_dict()}, RESUME_STATE_FILE + ".tmp")
+    os.replace(RESUME_STATE_FILE + ".tmp", RESUME_STATE_FILE)
 
 print(f"Training done. Total frames processed: {global_frame_count}, "
       f"final running average frame time: {total_process_time / max(global_frame_count, 1):.3f}s")

@@ -254,14 +254,17 @@ def _load_backbone(pretrained_path):
         return Qwen2_5_VLForConditionalGeneration.from_pretrained(pretrained_path, **load_kwargs)
 
 
-def build_openemma(pretrained_path, trained_checkpoint_path=None):
+def build_openemma(pretrained_path, trained_checkpoint_path=None, is_trainable=False):
     """
     Fresh training start: build_openemma(pretrained_path) -> brand-new
     LoRA adapters + brand-new diffusion head.
 
     Loading a trained checkpoint: build_openemma(pretrained_path,
     trained_checkpoint_path=...) -> loads the saved LoRA + diffusion head
-    weights on top of the same base backbone.
+    weights on top of the same base backbone. Pass is_trainable=True to keep
+    the loaded LoRA adapters trainable (resuming training, see
+    train_openemma.py's OPENEMMA_RESUME_FROM); the default loads them frozen
+    for inference.
     """
     backbone = _load_backbone(pretrained_path)
     if USE_4BIT:
@@ -282,7 +285,7 @@ def build_openemma(pretrained_path, trained_checkpoint_path=None):
                 p.data = p.data.float()
         return OpenEMMAPolicy(backbone, hidden_size, backbone_is_quantized=USE_4BIT)
 
-    backbone = PeftModel.from_pretrained(backbone, trained_checkpoint_path, is_trainable=False)
+    backbone = PeftModel.from_pretrained(backbone, trained_checkpoint_path, is_trainable=is_trainable)
     for name, p in backbone.named_parameters():
         if "lora_" in name:
             p.data = p.data.float()
