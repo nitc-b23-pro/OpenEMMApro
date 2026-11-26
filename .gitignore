@@ -28,3 +28,10 @@ openemma\YOLO3D\weights\resnet18.pkl
 build_model.py.bak_before_inferencedtypefix
 /Claude outputs
 note.ipynb
+epoch_loss.json
+models/
+openemmma_epoch*
+val_ade_epochs.json
+val_epoch_losses.json
+ep_loss_graph.jpg
+val_ade_graph.jpg
