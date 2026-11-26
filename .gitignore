@@ -30,7 +30,7 @@ build_model.py.bak_before_inferencedtypefix
 note.ipynb
 epoch_loss.json
 models/
-openemmma_epoch*
+openemmma_epoch*/
 val_ade_epochs.json
 val_epoch_losses.json
 ep_loss_graph.jpg
